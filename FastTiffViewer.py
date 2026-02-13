@@ -23,7 +23,7 @@ LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_WINDOW_SIZE = (1060, 800)
-MIN_WINDOW_SIZE = (530, 400)
+MIN_WINDOW_SIZE = (495, 400)
 WINDOW_TITLE = "Fast TIFF Viewer"
 CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12
 
@@ -708,6 +708,9 @@ class ImageView(QGraphicsView):
             return
         if window.isMaximized() or window.isFullScreen():
             return
+        keep_scene_center = None
+        if (not self._fit_mode) and self.has_image():
+            keep_scene_center = self.mapToScene(self.viewport().rect().center())
         screen = window.screen()
         if screen is None:
             screen = QApplication.primaryScreen()
@@ -726,16 +729,43 @@ class ImageView(QGraphicsView):
         old_frame = window.frameGeometry()
         old_cx = old_frame.center().x()
         old_cy = old_frame.center().y()
+        old_view_w = max(1, self.viewport().width())
+        old_view_h = max(1, self.viewport().height())
         frame_extra_w = max(0, old_frame.width() - old_geometry.width())
         frame_extra_h = max(0, old_frame.height() - old_geometry.height())
         max_w = max(MIN_WINDOW_SIZE[0], available.width() - frame_extra_w)
         max_h = max(MIN_WINDOW_SIZE[1], available.height() - frame_extra_h)
+        chrome_w = max(0, old_w - old_view_w)
+        chrome_h = max(0, old_h - old_view_h)
+        min_view_w = max(1, MIN_WINDOW_SIZE[0] - chrome_w)
+        min_view_h = max(1, MIN_WINDOW_SIZE[1] - chrome_h)
+        max_view_w = max(1, max_w - chrome_w)
+        max_view_h = max(1, max_h - chrome_h)
+        if max_view_w < min_view_w:
+            max_view_w = min_view_w
+        if max_view_h < min_view_h:
+            max_view_h = min_view_h
+        min_scale = max(min_view_w / old_view_w, min_view_h / old_view_h)
+        max_scale = min(max_view_w / old_view_w, max_view_h / old_view_h)
 
-        if zoom_in and old_w >= max_w and old_h >= max_h:
+        if zoom_in and max_scale <= 1.0:
+            return
+        if (not zoom_in) and min_scale >= 1.0:
             return
 
-        new_w = max(MIN_WINDOW_SIZE[0], int(round(old_w * factor)))
-        new_h = max(MIN_WINDOW_SIZE[1], int(round(old_h * factor)))
+        scale = factor
+        if zoom_in:
+            scale = min(scale, max_scale)
+        else:
+            scale = max(scale, min_scale)
+
+        new_view_w = int(round(old_view_w * scale))
+        new_view_h = int(round(old_view_h * scale))
+        new_view_w = min(max_view_w, max(min_view_w, new_view_w))
+        new_view_h = min(max_view_h, max(min_view_h, new_view_h))
+
+        new_w = max(MIN_WINDOW_SIZE[0], new_view_w + chrome_w)
+        new_h = max(MIN_WINDOW_SIZE[1], new_view_h + chrome_h)
         new_w = min(max_w, new_w)
         new_h = min(max_h, new_h)
         if new_w == old_w and new_h == old_h:
@@ -756,8 +786,10 @@ class ImageView(QGraphicsView):
         clamped_x = min(max(target_x, min_x), max_x)
         clamped_y = min(max(target_y, min_y), max_y)
         window.move(clamped_x, clamped_y)
+        if keep_scene_center is not None:
+            self.centerOn(keep_scene_center)
         log_debug(
-            "ImageView ctrl+wheel window_resize delta=%s steps=%s zoom_in=%s base=%.3f old=%sx%s new=%sx%s max=%sx%s center=%s,%s pos=%s,%s",
+            "ImageView ctrl+wheel window_resize delta=%s steps=%s zoom_in=%s base=%.3f old=%sx%s new=%sx%s view_old=%sx%s view_new=%sx%s scale=%.4f center=%s,%s pos=%s,%s keep_scene_center=%s",
             delta,
             steps,
             zoom_in,
@@ -766,12 +798,16 @@ class ImageView(QGraphicsView):
             old_h,
             new_w,
             new_h,
-            max_w,
-            max_h,
+            old_view_w,
+            old_view_h,
+            new_view_w,
+            new_view_h,
+            scale,
             old_cx,
             old_cy,
             clamped_x,
             clamped_y,
+            "yes" if keep_scene_center is not None else "no",
         )
 
     def mouseMoveEvent(self, event):
