@@ -21,7 +21,7 @@ import pyvips
 
 LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
-ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_WINDOW_SIZE = (1060, 800)
 MIN_WINDOW_SIZE = (495, 400)
 WINDOW_TITLE = "Fast TIFF Viewer"
@@ -31,9 +31,14 @@ FULLRES_PAGE_CHANGE_DELAY_MS = 180
 FULLRES_AFTER_PRELOAD_DELAY_MS = 80
 ZOOM_INTERACTION_IDLE_MS = 220
 FULLRES_AFTER_ZOOM_IDLE_DELAY_MS = 40
+FULLRES_AFTER_RESIZE_DELAY_MS = 140
 IDLE_PARTIAL_FULLRES_ENABLED = True
 IDLE_PARTIAL_FULLRES_SCALE = 1.8
 FIT_SNAP_TOLERANCE_RATIO = 1.01
+PREVIEW_RESIZE_UPDATE_DELAY_MS = 120
+PREVIEW_RESIZE_MIN_DELTA_PX = 64
+PREVIEW_RESIZE_SMOOTH = True
+PREVIEW_RESIZE_TARGET_SCALE = 1.35
 
 
 def setup_debug_logging():
@@ -534,6 +539,9 @@ class ImageView(QGraphicsView):
         self._zoom_interaction_timer = QTimer(self)
         self._zoom_interaction_timer.setSingleShot(True)
         self._zoom_interaction_timer.timeout.connect(self._on_zoom_interaction_idle)
+        self._preview_resize_timer = QTimer(self)
+        self._preview_resize_timer.setSingleShot(True)
+        self._preview_resize_timer.timeout.connect(self._refresh_current_preview_size)
         log_info(
             "ImageView init pool_threads=%s fullres_threads=%s",
             self._pool.maxThreadCount(),
@@ -597,6 +605,7 @@ class ImageView(QGraphicsView):
         self._mipmap_cache.clear()
         self._idle_fullres_timer.stop()
         self._zoom_interaction_timer.stop()
+        self._preview_resize_timer.stop()
         log_debug(
             "ImageView load_file reset generation=%s preview_target=%s",
             self._load_generation,
@@ -639,6 +648,7 @@ class ImageView(QGraphicsView):
             # まだ読み込み中。読み込み完了時に自動表示される。
             self.state_changed.emit()
 
+        self._schedule_preview_resize_update()
         self._schedule_fullres_upgrade(FULLRES_PAGE_CHANGE_DELAY_MS)
 
         return True
@@ -670,6 +680,9 @@ class ImageView(QGraphicsView):
         )
         if self._fit_mode and self.has_image():
             self.fit_in_view()
+        self._schedule_preview_resize_update()
+        if self.has_image():
+            self._schedule_fullres_upgrade(FULLRES_AFTER_RESIZE_DELAY_MS)
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -983,6 +996,67 @@ class ImageView(QGraphicsView):
         target_h = max(256, target_h)
         return QSize(target_w, target_h)
 
+    def _schedule_preview_resize_update(self, delay_ms: int = PREVIEW_RESIZE_UPDATE_DELAY_MS):
+        if not self._file_path:
+            return
+        if self._page_index < 0:
+            return
+        self._preview_resize_timer.start(max(1, int(delay_ms)))
+
+    def _refresh_current_preview_size(self):
+        if not self._file_path or self._page_index < 0:
+            return
+        index = self._page_index
+        preview = self._image_cache.get(index)
+        if preview is None or preview.isNull():
+            return
+        detail = self._fullres_cache.get(index)
+        if detail is None or detail.isNull():
+            return
+
+        viewport_target = self._preview_decode_size()
+        target_scale = max(1.0, float(PREVIEW_RESIZE_TARGET_SCALE))
+        if target_scale > 1.0:
+            viewport_target = QSize(
+                max(1, int(round(viewport_target.width() * target_scale))),
+                max(1, int(round(viewport_target.height() * target_scale))),
+            )
+        desired = _scale_to_fit(QSize(detail.width(), detail.height()), viewport_target)
+        if not desired.isValid():
+            return
+
+        if (
+            abs(preview.width() - desired.width()) < PREVIEW_RESIZE_MIN_DELTA_PX
+            and abs(preview.height() - desired.height()) < PREVIEW_RESIZE_MIN_DELTA_PX
+        ):
+            if index == self._page_index:
+                self._show_page(index, keep_view=True)
+            return
+
+        t0 = time.perf_counter()
+        mode = Qt.SmoothTransformation if PREVIEW_RESIZE_SMOOTH else Qt.FastTransformation
+        new_preview = detail.scaled(desired, Qt.KeepAspectRatio, mode)
+        if new_preview.isNull():
+            return
+
+        self._lru_put(index, new_preview)
+        self._mipmap_cache.pop(index, None)
+        log_info(
+            "ImageView preview_resize_update index=%s old=%s new=%s viewport=%s target_scale=%.2f detail=%s elapsed_ms=%.1f",
+            index,
+            _img_text(preview),
+            _img_text(new_preview),
+            _size_text(viewport_target),
+            target_scale,
+            _img_text(detail),
+            (time.perf_counter() - t0) * 1000.0,
+        )
+
+        if index == self._page_index:
+            self._show_page(index, keep_view=True)
+        else:
+            self.state_changed.emit()
+
     def _schedule_fullres_upgrade(self, delay_ms: int = FULLRES_IDLE_DELAY_MS):
         if not self._file_path:
             return
@@ -1097,14 +1171,13 @@ class ImageView(QGraphicsView):
 
         # Fit表示では detail を優先して初期表示品質を揃える
         if self._fit_mode and not detail_img.isNull():
-            if preview_img.isNull() or (detail_img.width() * detail_img.height() >= preview_img.width() * preview_img.height()):
-                log_debug(
-                    "ImageView choose_image prefer_detail_in_fit index=%s preview=%s detail=%s",
-                    index,
-                    _img_text(preview_img),
-                    _img_text(detail_img),
-                )
-                return detail_img
+            log_debug(
+                "ImageView choose_image prefer_detail_in_fit index=%s preview=%s detail=%s",
+                index,
+                _img_text(preview_img),
+                _img_text(detail_img),
+            )
+            return detail_img
 
         target = self._target_decode_size_for_current_view()
         if not target.isValid():
@@ -1370,6 +1443,7 @@ class ImageView(QGraphicsView):
 
         if index == self._page_index:
             self._show_page(index, keep_view=True)
+            self._schedule_preview_resize_update(1)
 
     @Slot(str, int)
     def _on_finished(self, err: str, generation: int):
