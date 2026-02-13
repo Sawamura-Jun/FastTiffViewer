@@ -26,6 +26,11 @@ DEFAULT_WINDOW_SIZE = (1060, 800)
 MIN_WINDOW_SIZE = (495, 400)
 WINDOW_TITLE = "Fast TIFF Viewer"
 CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12
+FULLRES_IDLE_DELAY_MS = 280
+FULLRES_PAGE_CHANGE_DELAY_MS = 180
+FULLRES_AFTER_PRELOAD_DELAY_MS = 80
+ZOOM_INTERACTION_IDLE_MS = 220
+FULLRES_AFTER_ZOOM_IDLE_DELAY_MS = 40
 
 
 def setup_debug_logging():
@@ -518,9 +523,14 @@ class ImageView(QGraphicsView):
         self._current_task = None
         self._load_generation = 0
         self._fullres_pending_pages = set()
+        self._deferred_fullres_request = False
+        self._zoom_interacting = False
         self._idle_fullres_timer = QTimer(self)
         self._idle_fullres_timer.setSingleShot(True)
         self._idle_fullres_timer.timeout.connect(self._request_fullres_current_page)
+        self._zoom_interaction_timer = QTimer(self)
+        self._zoom_interaction_timer.setSingleShot(True)
+        self._zoom_interaction_timer.timeout.connect(self._on_zoom_interaction_idle)
         log_info(
             "ImageView init pool_threads=%s fullres_threads=%s",
             self._pool.maxThreadCount(),
@@ -578,9 +588,12 @@ class ImageView(QGraphicsView):
         self._image_cache.clear()
         self._fullres_cache.clear()
         self._fullres_pending_pages.clear()
+        self._deferred_fullres_request = False
+        self._zoom_interacting = False
         self._page_source_sizes.clear()
         self._mipmap_cache.clear()
         self._idle_fullres_timer.stop()
+        self._zoom_interaction_timer.stop()
         log_debug(
             "ImageView load_file reset generation=%s preview_target=%s",
             self._load_generation,
@@ -623,7 +636,7 @@ class ImageView(QGraphicsView):
             # まだ読み込み中。読み込み完了時に自動表示される。
             self.state_changed.emit()
 
-        self._schedule_fullres_upgrade()
+        self._schedule_fullres_upgrade(FULLRES_PAGE_CHANGE_DELAY_MS)
 
         return True
 
@@ -642,7 +655,6 @@ class ImageView(QGraphicsView):
         self._fit_mode = True
         log_debug("ImageView fit_in_view br=%s scale=%.5f", _rect_text(br), self._current_view_scale())
         self.state_changed.emit()
-        self._schedule_fullres_upgrade()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -673,6 +685,34 @@ class ImageView(QGraphicsView):
         before_scale = self._current_view_scale()
         steps = max(1, abs(delta) // 120)
         zoom_in = delta > 0
+
+        can_change_scale = True
+        if not zoom_in:
+            if self._fit_mode:
+                can_change_scale = False
+            else:
+                fit_scale_before = self._fit_scale_for_viewport()
+                can_change_scale = before_scale > fit_scale_before * 1.001
+
+        if can_change_scale:
+            started_zoom_interaction = self._mark_zoom_interacting()
+            if started_zoom_interaction:
+                preview = self._image_cache.get(self._page_index)
+                detail = self._fullres_cache.get(self._page_index)
+                if (
+                    preview is not None
+                    and not preview.isNull()
+                    and detail is not None
+                    and not detail.isNull()
+                ):
+                    log_debug(
+                        "ImageView wheel switch_to_preview_on_zoom_start index=%s preview=%s detail=%s",
+                        self._page_index,
+                        _img_text(preview),
+                        _img_text(detail),
+                    )
+                    self._show_page(self._page_index, keep_view=True)
+
         for _ in range(steps):
             if zoom_in:
                 self.scale(1.25, 1.25)
@@ -693,18 +733,26 @@ class ImageView(QGraphicsView):
             self.scale(0.8, 0.8)
 
         after_scale = self._current_view_scale()
+        scale_changed = abs(after_scale - before_scale) > 1e-6
         log_debug(
-            "ImageView wheel delta=%s steps=%s zoom_in=%s scale_before=%.5f scale_after=%.5f fit_mode=%s target_decode=%s",
+            "ImageView wheel delta=%s steps=%s zoom_in=%s can_change=%s scale_changed=%s scale_before=%.5f scale_after=%.5f fit_mode=%s target_decode=%s",
             delta,
             steps,
             zoom_in,
+            "yes" if can_change_scale else "no",
+            "yes" if scale_changed else "no",
             before_scale,
             after_scale,
             self._fit_mode,
             _size_text(self._target_decode_size_for_current_view()),
         )
+
+        if not scale_changed:
+            event.accept()
+            return
+
         self.state_changed.emit()
-        self._schedule_fullres_upgrade()
+        self._schedule_fullres_upgrade(FULLRES_IDLE_DELAY_MS)
         event.accept()
 
     def _resize_window_with_ctrl_wheel(self, delta: int):
@@ -839,14 +887,12 @@ class ImageView(QGraphicsView):
         )
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
-            self._schedule_fullres_upgrade()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton:
-            self._schedule_fullres_upgrade()
+            self._schedule_fullres_upgrade(FULLRES_IDLE_DELAY_MS)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -912,10 +958,28 @@ class ImageView(QGraphicsView):
         target_h = max(256, target_h)
         return QSize(target_w, target_h)
 
-    def _schedule_fullres_upgrade(self):
+    def _schedule_fullres_upgrade(self, delay_ms: int = FULLRES_IDLE_DELAY_MS):
         if not self._file_path:
             return
-        self._idle_fullres_timer.start(220)
+        self._idle_fullres_timer.start(max(1, int(delay_ms)))
+
+    def _mark_zoom_interacting(self) -> bool:
+        started = False
+        if not self._zoom_interacting:
+            self._zoom_interacting = True
+            started = True
+            log_debug("ImageView zoom_interaction start")
+        self._zoom_interaction_timer.start(max(1, int(ZOOM_INTERACTION_IDLE_MS)))
+        return started
+
+    def _on_zoom_interaction_idle(self):
+        if not self._zoom_interacting:
+            return
+        self._zoom_interacting = False
+        log_debug("ImageView zoom_interaction idle")
+        if self._file_path and self.has_image() and self._page_index >= 0:
+            self._show_page(self._page_index, keep_view=True)
+        self._schedule_fullres_upgrade(FULLRES_AFTER_ZOOM_IDLE_DELAY_MS)
 
     def _lru_put(self, key, value):
         if key in self._image_cache:
@@ -978,6 +1042,16 @@ class ImageView(QGraphicsView):
         if not candidates:
             return QImage()
 
+        if self._zoom_interacting and not preview_img.isNull():
+            if not detail_img.isNull():
+                log_debug(
+                    "ImageView choose_image prefer_preview_during_zoom index=%s preview=%s detail=%s",
+                    index,
+                    _img_text(preview_img),
+                    _img_text(detail_img),
+                )
+            return preview_img
+
         source_size = self._page_source_sizes.get(index)
         if (
             source_size is not None
@@ -986,10 +1060,9 @@ class ImageView(QGraphicsView):
             and not detail_img.isNull()
         ):
             detail_is_source = detail_img.width() >= source_size.width() and detail_img.height() >= source_size.height()
-            preview_is_upscaled = preview_img.width() > source_size.width() or preview_img.height() > source_size.height()
-            if detail_is_source and preview_is_upscaled:
+            if detail_is_source:
                 log_debug(
-                    "ImageView choose_image prefer_detail index=%s preview=%s detail=%s source=%s",
+                    "ImageView choose_image prefer_source_detail index=%s preview=%s detail=%s source=%s",
                     index,
                     _img_text(preview_img),
                     _img_text(detail_img),
@@ -1080,11 +1153,18 @@ class ImageView(QGraphicsView):
 
         self.setFocus(Qt.OtherFocusReason)
         self.state_changed.emit()
-        self._schedule_fullres_upgrade()
 
     def _request_fullres_current_page(self):
         if not self._file_path:
             log_debug("ImageView _request_fullres skip no file")
+            return
+        if self._zoom_interacting:
+            self._deferred_fullres_request = True
+            log_debug("ImageView _request_fullres defer while zoom interacting")
+            return
+        if self._current_task is not None:
+            self._deferred_fullres_request = True
+            log_debug("ImageView _request_fullres defer while preload running")
             return
         index = self._page_index
         if index < 0:
@@ -1097,31 +1177,13 @@ class ImageView(QGraphicsView):
             log_debug("ImageView _request_fullres skip preview_missing index=%s", index)
             return
 
-        target = self._target_decode_size_for_current_view()
-        if not target.isValid():
-            log_debug("ImageView _request_fullres skip invalid target index=%s", index)
-            return
-
         source_size = self._page_source_sizes.get(index)
-        if source_size is not None and source_size.isValid():
-            bounded_target = target.boundedTo(source_size)
-            if bounded_target.width() > 0 and bounded_target.height() > 0:
-                if bounded_target != target:
-                    log_debug(
-                        "ImageView _request_fullres clamp_target index=%s target=%s source=%s bounded=%s",
-                        index,
-                        _size_text(target),
-                        _size_text(source_size),
-                        _size_text(bounded_target),
-                    )
-                target = bounded_target
 
         cached = self._fullres_cache.get(index)
         if cached is not None and not cached.isNull():
-            enough = cached.width() >= target.width() and cached.height() >= target.height()
-            too_large = cached.width() > target.width() * 2 or cached.height() > target.height() * 2
             if source_size is not None and source_size.isValid():
                 if cached.width() >= source_size.width() and cached.height() >= source_size.height():
+                    self._deferred_fullres_request = False
                     log_debug(
                         "ImageView _request_fullres skip reached_source index=%s cached=%s source=%s",
                         index,
@@ -1129,23 +1191,26 @@ class ImageView(QGraphicsView):
                         _size_text(source_size),
                     )
                     return
-            if enough and not too_large:
-                log_debug(
-                    "ImageView _request_fullres skip cached_enough index=%s cached=%s target=%s",
-                    index,
-                    _img_text(cached),
-                    _size_text(target),
-                )
-                return
+
+        # 操作が止まったタイミングで、常に元解像度画像を取得する。
+        # source_size 未確定時は target を invalid にして "full decode" を要求する。
+        if source_size is not None and source_size.isValid():
+            target = QSize(source_size)
+            req_mode = "source_size"
+        else:
+            target = QSize()
+            req_mode = "source_full"
 
         gen = self._load_generation
         task = FullResPageTask(self._file_path, index, gen, target)
         task.signals.loaded.connect(self._on_fullres_loaded)
         self._fullres_pending_pages.add(index)
+        self._deferred_fullres_request = False
         log_info(
-            "ImageView _request_fullres start index=%s generation=%s target=%s cached=%s scale=%.5f",
+            "ImageView _request_fullres start index=%s generation=%s mode=%s target=%s cached=%s scale=%.5f",
             index,
             gen,
+            req_mode,
             _size_text(target),
             _img_text(cached) if cached is not None else "none",
             self._current_view_scale(),
@@ -1260,6 +1325,12 @@ class ImageView(QGraphicsView):
         else:
             log_info("ImageView all_pages_finished generation=%s ok", generation)
         self.state_changed.emit()
+        if not err and self._file_path:
+            if self._deferred_fullres_request:
+                log_debug("ImageView all_pages_finished run deferred fullres request")
+            else:
+                log_debug("ImageView all_pages_finished schedule initial fullres request")
+            self._schedule_fullres_upgrade(FULLRES_AFTER_PRELOAD_DELAY_MS)
 
 
 # ---------- MainWindow ----------
