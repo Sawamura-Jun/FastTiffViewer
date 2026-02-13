@@ -1225,15 +1225,15 @@ class MainWindow(QMainWindow):
         self.act_next.setShortcut(Qt.Key_PageDown)
         self.act_next.triggered.connect(self.view.next_page)
 
-        self.act_fit = QAction("Fit(f)", self)
+        self.act_fit = QAction("Fit(F)", self)
         self.act_fit.setShortcut(Qt.Key_F)
         self.act_fit.triggered.connect(self.view.fit_in_view)
 
-        self.act_next_file = QAction("NextFile(n)", self)
+        self.act_next_file = QAction("NextFile(N)", self)
         self.act_next_file.setShortcut(Qt.Key_N)
         self.act_next_file.triggered.connect(self.open_next_file)
 
-        self.act_prev_file = QAction("PrevFile(b)", self)
+        self.act_prev_file = QAction("PrevFile(B)", self)
         self.act_prev_file.setShortcut(Qt.Key_B)
         self.act_prev_file.triggered.connect(self.open_prev_file)
 
