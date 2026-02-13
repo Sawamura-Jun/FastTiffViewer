@@ -21,7 +21,7 @@ import pyvips
 
 LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
-ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def setup_debug_logging():
