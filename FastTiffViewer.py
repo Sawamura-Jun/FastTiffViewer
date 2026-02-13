@@ -22,6 +22,10 @@ import pyvips
 LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_WINDOW_SIZE = (1060, 800)
+MIN_WINDOW_SIZE = (530, 400)
+WINDOW_TITLE = "Fast TIFF Viewer"
+CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12
 
 
 def setup_debug_logging():
@@ -649,12 +653,17 @@ class ImageView(QGraphicsView):
             self.fit_in_view()
 
     def wheelEvent(self, event):
-        br = self._item.boundingRect()
-        if br.isNull():
-            return
-
         delta = event.angleDelta().y()
         if delta == 0:
+            return
+
+        if event.modifiers() & Qt.ControlModifier:
+            self._resize_window_with_ctrl_wheel(delta)
+            event.accept()
+            return
+
+        br = self._item.boundingRect()
+        if br.isNull():
             return
 
         before_scale = self._current_view_scale()
@@ -692,6 +701,78 @@ class ImageView(QGraphicsView):
         )
         self._schedule_fullres_upgrade()
         event.accept()
+
+    def _resize_window_with_ctrl_wheel(self, delta: int):
+        window = self.window()
+        if window is None:
+            return
+        if window.isMaximized() or window.isFullScreen():
+            return
+        screen = window.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+
+        steps = max(1, abs(delta) // 120)
+        zoom_in = delta > 0
+        base = max(1.001, float(CTRL_WHEEL_WINDOW_SCALE_BASE))
+        factor = (base ** steps) if zoom_in else ((1.0 / base) ** steps)
+
+        old_w = window.width()
+        old_h = window.height()
+        old_geometry = window.geometry()
+        old_frame = window.frameGeometry()
+        old_cx = old_frame.center().x()
+        old_cy = old_frame.center().y()
+        frame_extra_w = max(0, old_frame.width() - old_geometry.width())
+        frame_extra_h = max(0, old_frame.height() - old_geometry.height())
+        max_w = max(MIN_WINDOW_SIZE[0], available.width() - frame_extra_w)
+        max_h = max(MIN_WINDOW_SIZE[1], available.height() - frame_extra_h)
+
+        if zoom_in and old_w >= max_w and old_h >= max_h:
+            return
+
+        new_w = max(MIN_WINDOW_SIZE[0], int(round(old_w * factor)))
+        new_h = max(MIN_WINDOW_SIZE[1], int(round(old_h * factor)))
+        new_w = min(max_w, new_w)
+        new_h = min(max_h, new_h)
+        if new_w == old_w and new_h == old_h:
+            return
+
+        window.resize(new_w, new_h)
+        new_frame = window.frameGeometry()
+        target_x = old_cx - (new_frame.width() // 2)
+        target_y = old_cy - (new_frame.height() // 2)
+        min_x = available.left()
+        min_y = available.top()
+        max_x = available.right() - new_frame.width() + 1
+        max_y = available.bottom() - new_frame.height() + 1
+        if max_x < min_x:
+            max_x = min_x
+        if max_y < min_y:
+            max_y = min_y
+        clamped_x = min(max(target_x, min_x), max_x)
+        clamped_y = min(max(target_y, min_y), max_y)
+        window.move(clamped_x, clamped_y)
+        log_debug(
+            "ImageView ctrl+wheel window_resize delta=%s steps=%s zoom_in=%s base=%.3f old=%sx%s new=%sx%s max=%sx%s center=%s,%s pos=%s,%s",
+            delta,
+            steps,
+            zoom_in,
+            base,
+            old_w,
+            old_h,
+            new_w,
+            new_h,
+            max_w,
+            max_h,
+            old_cx,
+            old_cy,
+            clamped_x,
+            clamped_y,
+        )
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.LeftButton:
@@ -1123,7 +1204,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Fast TIFF Viewer")
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setMinimumSize(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1])
         self._apply_window_icon()
         log_info("MainWindow init")
 
@@ -1143,14 +1225,16 @@ class MainWindow(QMainWindow):
         self.act_next.setShortcut(Qt.Key_PageDown)
         self.act_next.triggered.connect(self.view.next_page)
 
-        self.act_fit = QAction("Fit", self)
+        self.act_fit = QAction("Fit(f)", self)
         self.act_fit.setShortcut(Qt.Key_F)
         self.act_fit.triggered.connect(self.view.fit_in_view)
 
-        self.act_next_file = QAction("NextFile", self)
+        self.act_next_file = QAction("NextFile(n)", self)
+        self.act_next_file.setShortcut(Qt.Key_N)
         self.act_next_file.triggered.connect(self.open_next_file)
 
-        self.act_prev_file = QAction("PrevFile", self)
+        self.act_prev_file = QAction("PrevFile(b)", self)
+        self.act_prev_file.setShortcut(Qt.Key_B)
         self.act_prev_file.triggered.connect(self.open_prev_file)
 
         tb = self.addToolBar("Main")
@@ -1321,7 +1405,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     w = MainWindow()
-    w.resize(1060, 800)
+    w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
     w.show()
     log_info("main window shown size=%sx%s", w.width(), w.height())
     QTimer.singleShot(0, lambda: w.open_from_cli_args(sys.argv[1:]))
