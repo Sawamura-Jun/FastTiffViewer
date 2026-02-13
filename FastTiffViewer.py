@@ -31,6 +31,9 @@ FULLRES_PAGE_CHANGE_DELAY_MS = 180
 FULLRES_AFTER_PRELOAD_DELAY_MS = 80
 ZOOM_INTERACTION_IDLE_MS = 220
 FULLRES_AFTER_ZOOM_IDLE_DELAY_MS = 40
+IDLE_PARTIAL_FULLRES_ENABLED = True
+IDLE_PARTIAL_FULLRES_SCALE = 1.8
+FIT_SNAP_TOLERANCE_RATIO = 1.01
 
 
 def setup_debug_logging():
@@ -733,6 +736,19 @@ class ImageView(QGraphicsView):
             self.scale(0.8, 0.8)
 
         after_scale = self._current_view_scale()
+        if (not zoom_in) and (not self._fit_mode):
+            fit_scale_after = self._fit_scale_for_viewport()
+            snap_ratio = max(1.0, float(FIT_SNAP_TOLERANCE_RATIO))
+            if fit_scale_after > 0.0 and after_scale <= fit_scale_after * snap_ratio:
+                log_debug(
+                    "ImageView wheel snap_to_fit after_scale=%.5f fit_scale=%.5f ratio=%.5f",
+                    after_scale,
+                    fit_scale_after,
+                    snap_ratio,
+                )
+                self.fit_in_view()
+                after_scale = self._current_view_scale()
+
         scale_changed = abs(after_scale - before_scale) > 1e-6
         log_debug(
             "ImageView wheel delta=%s steps=%s zoom_in=%s can_change=%s scale_changed=%s scale_before=%.5f scale_after=%.5f fit_mode=%s target_decode=%s",
@@ -748,6 +764,15 @@ class ImageView(QGraphicsView):
         )
 
         if not scale_changed:
+            if (not zoom_in) and self._fit_mode and (not self._zoom_interacting):
+                detail = self._fullres_cache.get(self._page_index)
+                if detail is not None and not detail.isNull():
+                    log_debug(
+                        "ImageView wheel keep_detail_in_fit_on_no_scale index=%s detail=%s",
+                        self._page_index,
+                        _img_text(detail),
+                    )
+                    self._show_page(self._page_index, keep_view=True)
             event.accept()
             return
 
@@ -1070,6 +1095,17 @@ class ImageView(QGraphicsView):
                 )
                 return detail_img
 
+        # Fit表示では detail を優先して初期表示品質を揃える
+        if self._fit_mode and not detail_img.isNull():
+            if preview_img.isNull() or (detail_img.width() * detail_img.height() >= preview_img.width() * preview_img.height()):
+                log_debug(
+                    "ImageView choose_image prefer_detail_in_fit index=%s preview=%s detail=%s",
+                    index,
+                    _img_text(preview_img),
+                    _img_text(detail_img),
+                )
+                return detail_img
+
         target = self._target_decode_size_for_current_view()
         if not target.isValid():
             return candidates[0]
@@ -1178,6 +1214,36 @@ class ImageView(QGraphicsView):
             return
 
         source_size = self._page_source_sizes.get(index)
+        current_target = self._target_decode_size_for_current_view()
+        if IDLE_PARTIAL_FULLRES_ENABLED and current_target.isValid():
+            scale = max(1.0, float(IDLE_PARTIAL_FULLRES_SCALE))
+            target = QSize(
+                max(1, int(round(current_target.width() * scale))),
+                max(1, int(round(current_target.height() * scale))),
+            )
+            req_mode = f"scaled_view_x{scale:.2f}"
+        else:
+            # 旧挙動: sourceサイズが分かっていればそれを要求、未確定ならフルデコード要求
+            if source_size is not None and source_size.isValid():
+                target = QSize(source_size)
+                req_mode = "source_size"
+            else:
+                target = QSize()
+                req_mode = "source_full"
+
+        if source_size is not None and source_size.isValid() and target.isValid():
+            bounded = target.boundedTo(source_size)
+            if bounded.width() > 0 and bounded.height() > 0:
+                if bounded != target:
+                    log_debug(
+                        "ImageView _request_fullres clamp_target index=%s mode=%s target=%s source=%s bounded=%s",
+                        index,
+                        req_mode,
+                        _size_text(target),
+                        _size_text(source_size),
+                        _size_text(bounded),
+                    )
+                target = bounded
 
         cached = self._fullres_cache.get(index)
         if cached is not None and not cached.isNull():
@@ -1191,15 +1257,17 @@ class ImageView(QGraphicsView):
                         _size_text(source_size),
                     )
                     return
-
-        # 操作が止まったタイミングで、常に元解像度画像を取得する。
-        # source_size 未確定時は target を invalid にして "full decode" を要求する。
-        if source_size is not None and source_size.isValid():
-            target = QSize(source_size)
-            req_mode = "source_size"
-        else:
-            target = QSize()
-            req_mode = "source_full"
+            if target.isValid():
+                if cached.width() >= target.width() and cached.height() >= target.height():
+                    self._deferred_fullres_request = False
+                    log_debug(
+                        "ImageView _request_fullres skip cached_enough index=%s mode=%s cached=%s target=%s",
+                        index,
+                        req_mode,
+                        _img_text(cached),
+                        _size_text(target),
+                    )
+                    return
 
         gen = self._load_generation
         task = FullResPageTask(self._file_path, index, gen, target)
