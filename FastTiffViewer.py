@@ -1098,7 +1098,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TIFF Viewer")
+        self.setWindowTitle("Fast TIFF Viewer")
         self._apply_window_icon()
         log_info("MainWindow init")
 
