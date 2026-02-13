@@ -103,6 +103,25 @@ def _find_app_icon_path() -> str:
     return ""
 
 
+def _default_open_directory() -> str:
+    candidates = []
+    if os.name == "nt":
+        one_drive = os.environ.get("OneDrive")
+        user_profile = os.environ.get("USERPROFILE")
+        if one_drive:
+            candidates.append(Path(one_drive) / "Desktop")
+        if user_profile:
+            candidates.append(Path(user_profile) / "Desktop")
+
+    candidates.append(Path.home() / "Desktop")
+    candidates.append(Path.home())
+
+    for p in candidates:
+        if p.exists() and p.is_dir():
+            return str(p)
+    return str(Path.home())
+
+
 def _vips_error_text(exc: Exception) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
@@ -1100,7 +1119,7 @@ class ImageView(QGraphicsView):
 
 # ---------- MainWindow ----------
 class MainWindow(QMainWindow):
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff"}
+    IMAGE_EXTENSIONS = {".tif", ".tiff"}
 
     def __init__(self):
         super().__init__()
@@ -1192,9 +1211,9 @@ class MainWindow(QMainWindow):
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open image",
-            str(Path.home()),
-            "Images (*.jpg *.jpeg *.png *.bmp *.gif *.tif *.tiff);;All Files (*.*)",
+            "Open TIFF",
+            _default_open_directory(),
+            "TIFF Files (*.tif *.tiff)",
         )
         if not path:
             log_debug("MainWindow open_file canceled")
