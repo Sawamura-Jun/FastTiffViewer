@@ -545,6 +545,9 @@ class ImageView(QGraphicsView):
     def has_image(self):
         return not self._item.boundingRect().isNull()
 
+    def is_fit_mode(self) -> bool:
+        return self._fit_mode
+
     def current_pixel_size_text(self) -> str:
         source_size = self._page_source_sizes.get(self._page_index)
         if source_size is not None and source_size.isValid():
@@ -638,6 +641,7 @@ class ImageView(QGraphicsView):
         self.fitInView(br, Qt.KeepAspectRatio)
         self._fit_mode = True
         log_debug("ImageView fit_in_view br=%s scale=%.5f", _rect_text(br), self._current_view_scale())
+        self.state_changed.emit()
         self._schedule_fullres_upgrade()
 
     def resizeEvent(self, event):
@@ -699,6 +703,7 @@ class ImageView(QGraphicsView):
             self._fit_mode,
             _size_text(self._target_decode_size_for_current_view()),
         )
+        self.state_changed.emit()
         self._schedule_fullres_upgrade()
         event.accept()
 
@@ -1333,6 +1338,7 @@ class MainWindow(QMainWindow):
         pi = self.view.page_index()
         loaded = self.view.loaded_count()
         err = self.view.last_error()
+        mode_text = "Fit" if self.view.is_fit_mode() else "Non-Fit"
 
         self.act_prev.setEnabled(has_file and pc > 1 and pi > 0)
         self.act_next.setEnabled(has_file and pc > 1 and (pc == 0 or pi < pc - 1))
@@ -1344,12 +1350,14 @@ class MainWindow(QMainWindow):
             name = Path(self.view.file_path()).name
             pixel_size = self.view.current_pixel_size_text()
             if pc > 0:
-                msg = f"{name}  Page {pi+1}/{pc}  Loaded {loaded}/{pc}  Pixel {pixel_size}"
+                msg = f"{name}  Page {pi+1}/{pc}  Loaded {loaded}/{pc}  Pixel {pixel_size}  Mode {mode_text}"
             else:
-                msg = f"{name}  Page {pi+1}  Loaded {loaded}  Pixel {pixel_size}"
+                msg = f"{name}  Page {pi+1}  Loaded {loaded}  Pixel {pixel_size}  Mode {mode_text}"
             if err:
                 msg += f"   (Error: {err})"
             self.statusBar().showMessage(msg)
+        else:
+            self.statusBar().showMessage(f"Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan  Mode {mode_text}")
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
