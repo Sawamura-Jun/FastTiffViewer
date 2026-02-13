@@ -6,7 +6,7 @@ from pathlib import Path
 from collections import OrderedDict
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QRunnable, QThreadPool, QRectF, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QIcon, QImage, QPainter
+from PySide6.QtGui import QAction, QIcon, QImage, QImageReader, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -21,7 +21,7 @@ import pyvips
 
 LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
-ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def setup_debug_logging():
@@ -406,16 +406,55 @@ class FullResPageTask(QRunnable):
     def run(self):
         t0 = time.perf_counter()
         log_debug(
-            "FullResPageTask(py vips) start page=%s generation=%s target=%s file=%s",
+            "FullResPageTask start page=%s generation=%s target=%s file=%s",
             self.page_index,
             self.generation,
             _size_text(self.target_size),
             self.file_path,
         )
-        img, source_size, err = _load_vips_page(self.file_path, self.page_index, self.target_size)
-        if img.isNull() or err:
-            if not err:
-                err = "decode failed"
+        reader = QImageReader(self.file_path)
+        reader.setAutoTransform(True)
+
+        if self.page_index > 0:
+            jumped = False
+            if hasattr(reader, "jumpToImage"):
+                jumped = reader.jumpToImage(self.page_index)
+            elif hasattr(reader, "jumpToNextImage"):
+                jumped = True
+                for _ in range(self.page_index):
+                    if not reader.jumpToNextImage():
+                        jumped = False
+                        break
+
+            if not jumped:
+                log_info("FullResPageTask jump failed page=%s generation=%s", self.page_index, self.generation)
+                self.signals.loaded.emit(
+                    self.page_index,
+                    QImage(),
+                    f"jump to page {self.page_index} failed",
+                    self.generation,
+                    QSize(),
+                )
+                return
+
+        source_size = reader.size()
+        if self.target_size.isValid():
+            if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
+                bounded = self.target_size.boundedTo(source_size)
+                if bounded.width() > 0 and bounded.height() > 0:
+                    reader.setScaledSize(bounded)
+                    log_debug(
+                        "FullResPageTask setScaledSize page=%s src=%s bounded=%s",
+                        self.page_index,
+                        _size_text(source_size),
+                        _size_text(bounded),
+                    )
+            else:
+                log_debug("FullResPageTask src size unavailable page=%s", self.page_index)
+
+        img = reader.read()
+        if img.isNull():
+            err = reader.errorString() if hasattr(reader, "errorString") else "read() failed"
             log_info(
                 "FullResPageTask read failed page=%s generation=%s err=%s elapsed_ms=%.1f",
                 self.page_index,
@@ -1293,6 +1332,12 @@ if __name__ == "__main__":
     setup_debug_logging()
     log_info("log_file=%s", str(LOG_FILE_PATH))
     log_info("pyvips=%s libvips=%s.%s.%s", pyvips.__version__, pyvips.version(0), pyvips.version(1), pyvips.version(2))
+    if hasattr(QImageReader, "setAllocationLimit"):
+        old_limit = QImageReader.allocationLimit() if hasattr(QImageReader, "allocationLimit") else -1
+        # Large TIFF pages can exceed the default Qt safety limit.
+        QImageReader.setAllocationLimit(0)
+        new_limit = QImageReader.allocationLimit() if hasattr(QImageReader, "allocationLimit") else -1
+        log_info("QImageReader allocation limit changed old=%sMB new=%sMB", old_limit, new_limit)
     app = QApplication(sys.argv)
 
     w = MainWindow()
