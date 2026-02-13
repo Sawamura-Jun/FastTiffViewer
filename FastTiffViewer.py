@@ -748,21 +748,42 @@ class ImageView(QGraphicsView):
         min_scale = max(min_view_w / old_view_w, min_view_h / old_view_h)
         max_scale = min(max_view_w / old_view_w, max_view_h / old_view_h)
 
-        if zoom_in and max_scale <= 1.0:
-            return
-        if (not zoom_in) and min_scale >= 1.0:
-            return
+        mode = "ratio"
+        scale_x = factor
+        scale_y = factor
 
-        scale = factor
         if zoom_in:
-            scale = min(scale, max_scale)
+            # 片辺が上限に達したら比率固定を外し、残りの辺も画面上限まで拡げられるようにする
+            at_limit = old_view_w >= max_view_w or old_view_h >= max_view_h
+            reach_limit = (old_view_w * factor) >= max_view_w or (old_view_h * factor) >= max_view_h
+            if at_limit or reach_limit:
+                mode = "fill"
+                new_view_w = int(round(old_view_w * factor))
+                new_view_h = int(round(old_view_h * factor))
+                new_view_w = min(max_view_w, max(min_view_w, new_view_w))
+                new_view_h = min(max_view_h, max(min_view_h, new_view_h))
+                scale_x = new_view_w / old_view_w
+                scale_y = new_view_h / old_view_h
+            else:
+                if max_scale <= 1.0:
+                    return
+                scale = min(factor, max_scale)
+                new_view_w = int(round(old_view_w * scale))
+                new_view_h = int(round(old_view_h * scale))
+                new_view_w = min(max_view_w, max(min_view_w, new_view_w))
+                new_view_h = min(max_view_h, max(min_view_h, new_view_h))
+                scale_x = scale
+                scale_y = scale
         else:
-            scale = max(scale, min_scale)
-
-        new_view_w = int(round(old_view_w * scale))
-        new_view_h = int(round(old_view_h * scale))
-        new_view_w = min(max_view_w, max(min_view_w, new_view_w))
-        new_view_h = min(max_view_h, max(min_view_h, new_view_h))
+            if min_scale >= 1.0:
+                return
+            scale = max(factor, min_scale)
+            new_view_w = int(round(old_view_w * scale))
+            new_view_h = int(round(old_view_h * scale))
+            new_view_w = min(max_view_w, max(min_view_w, new_view_w))
+            new_view_h = min(max_view_h, max(min_view_h, new_view_h))
+            scale_x = scale
+            scale_y = scale
 
         new_w = max(MIN_WINDOW_SIZE[0], new_view_w + chrome_w)
         new_h = max(MIN_WINDOW_SIZE[1], new_view_h + chrome_h)
@@ -789,10 +810,11 @@ class ImageView(QGraphicsView):
         if keep_scene_center is not None:
             self.centerOn(keep_scene_center)
         log_debug(
-            "ImageView ctrl+wheel window_resize delta=%s steps=%s zoom_in=%s base=%.3f old=%sx%s new=%sx%s view_old=%sx%s view_new=%sx%s scale=%.4f center=%s,%s pos=%s,%s keep_scene_center=%s",
+            "ImageView ctrl+wheel window_resize delta=%s steps=%s zoom_in=%s mode=%s base=%.3f old=%sx%s new=%sx%s view_old=%sx%s view_new=%sx%s scale_xy=%.4f,%.4f center=%s,%s pos=%s,%s keep_scene_center=%s",
             delta,
             steps,
             zoom_in,
+            mode,
             base,
             old_w,
             old_h,
@@ -802,7 +824,8 @@ class ImageView(QGraphicsView):
             old_view_h,
             new_view_w,
             new_view_h,
-            scale,
+            scale_x,
+            scale_y,
             old_cx,
             old_cy,
             clamped_x,
