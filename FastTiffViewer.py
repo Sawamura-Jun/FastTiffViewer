@@ -77,19 +77,25 @@ def _rect_text(rect: QRectF) -> str:
 
 
 def _find_app_icon_path() -> str:
-    icon_rel = Path("ico") / "TiffViewer.ico"
+    icon_names = ["FastTiffViewer.ico", "TiffViewer.ico"]
     candidates = []
 
     # PyInstaller（onefile / onedir）
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / icon_rel)
+        base = Path(meipass) / "ico"
+        for name in icon_names:
+            candidates.append(base / name)
 
     # 実行ファイルの隣（PyInstaller onedir）
-    candidates.append(Path(sys.executable).resolve().parent / icon_rel)
+    base = Path(sys.executable).resolve().parent / "ico"
+    for name in icon_names:
+        candidates.append(base / name)
 
     # 通常のpython実行（スクリプト基準）
-    candidates.append(Path(__file__).resolve().parent / icon_rel)
+    base = Path(__file__).resolve().parent / "ico"
+    for name in icon_names:
+        candidates.append(base / name)
 
     for p in candidates:
         if p.is_file():
