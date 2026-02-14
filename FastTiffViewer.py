@@ -21,24 +21,28 @@ import pyvips
 
 LOG_FILE_PATH = Path(__file__).with_name("fasttiffviewer_debug.log")
 LOGGER = logging.getLogger("fasttiffviewer")
-ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
-DEFAULT_WINDOW_SIZE = (1060, 800)
-MIN_WINDOW_SIZE = (495, 400)
-WINDOW_TITLE = "Fast TIFF Viewer"
-CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12
-FULLRES_IDLE_DELAY_MS = 280
-FULLRES_PAGE_CHANGE_DELAY_MS = 180
-FULLRES_AFTER_PRELOAD_DELAY_MS = 80
-ZOOM_INTERACTION_IDLE_MS = 220
-FULLRES_AFTER_ZOOM_IDLE_DELAY_MS = 40
-FULLRES_AFTER_RESIZE_DELAY_MS = 140
-IDLE_PARTIAL_FULLRES_ENABLED = True
-IDLE_PARTIAL_FULLRES_SCALE = 1.8
-FIT_SNAP_TOLERANCE_RATIO = 1.01
-PREVIEW_RESIZE_UPDATE_DELAY_MS = 120
-PREVIEW_RESIZE_MIN_DELTA_PX = 64
-PREVIEW_RESIZE_SMOOTH = True
-PREVIEW_RESIZE_TARGET_SCALE = 1.0 #1.35
+ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 上記 "0"を"1"でlogファイル出力
+
+WINDOW_TITLE = "Fast TIFF Viewer v1.1.0"
+
+# 表示/デコード挙動の調整パラメータ
+DEFAULT_WINDOW_SIZE = (1060, 800)       # アプリ起動時の初期ウィンドウサイズ(px)
+MIN_WINDOW_SIZE = (495, 400)            # ウィンドウの最小許容サイズ(px)
+CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12     # Ctrl+ホイール1段あたりのウィンドウ拡縮倍率
+FULLRES_IDLE_DELAY_MS = 280             # 通常操作後にfullresデコード要求を出すまでの待機時間(ms)
+FULLRES_PAGE_CHANGE_DELAY_MS = 180      # ページ切替直後にfullres要求するまでの遅延(ms)
+FULLRES_AFTER_PRELOAD_DELAY_MS = 80     # 全ページプレビュー先読み完了後にfullres要求する遅延(ms)
+ZOOM_INTERACTION_IDLE_MS = 220          # ズーム連続操作を終了とみなす無操作時間(ms)
+FULLRES_AFTER_ZOOM_IDLE_DELAY_MS = 40   # ズーム終了後にfullres要求するまでの遅延(ms)
+FULLRES_AFTER_RESIZE_DELAY_MS = 140     # ウィンドウリサイズ後にfullres要求するまでの遅延(ms)
+IDLE_PARTIAL_FULLRES_ENABLED = True     # アイドル時の段階的fullres（部分高解像度）要求を有効化するか
+IDLE_PARTIAL_FULLRES_SCALE = 1.8        # 現在表示サイズに対して先行要求するfullres倍率
+FIT_SNAP_TOLERANCE_RATIO = 1.01         # 縮小時にFitへ吸着する許容比率（1.0に近いほど厳密）
+PREVIEW_RESIZE_UPDATE_DELAY_MS = 120    # リサイズ後にプレビュー再生成を実行するまでの遅延(ms)
+PREVIEW_RESIZE_MIN_DELTA_PX = 64        # プレビュー再生成を行う最小サイズ差分(px)
+PREVIEW_RESIZE_SMOOTH = True            # プレビュー再生成時に滑らか補間を使うか
+PREVIEW_RESIZE_TARGET_SCALE = 1.0       # プレビュー再生成時の目標倍率（ビューポート基準）
 
 
 def setup_debug_logging():
@@ -157,6 +161,7 @@ def _scale_to_fit(source_size: QSize, max_size: QSize) -> QSize:
 
 
 def _decode_vips_image(vips_img: pyvips.Image, max_size: QSize = QSize()):
+    # 先に表示サイズ近傍へ縮小してからQImage化し、初期表示の体感速度を上げる
     source_size = QSize(vips_img.width, vips_img.height)
     target_size = _scale_to_fit(source_size, max_size)
 
@@ -189,6 +194,7 @@ def _load_vips_page(file_path: str, page_index: int, max_size: QSize = QSize()):
 
 
 def _qimage_from_vips(vips_img: pyvips.Image) -> QImage:
+    # libvipsのバンド構成をQtで扱える8bit RGB/RGBA/Grayへ正規化する
     img = vips_img
     if img.format != "uchar":
         img = img.cast("uchar")
@@ -345,6 +351,7 @@ class AllPagesLoadTask(QRunnable):
 
     def run(self):
         t0 = time.perf_counter()
+        # プレビュー用の低解像度を全ページ先読み（ページ移動の待ちを減らす）
         log_info(
             "AllPagesLoadTask(py vips) start file=%s generation=%s preview_max=%s",
             self.file_path,
@@ -1029,6 +1036,7 @@ class ImageView(QGraphicsView):
             abs(preview.width() - desired.width()) < PREVIEW_RESIZE_MIN_DELTA_PX
             and abs(preview.height() - desired.height()) < PREVIEW_RESIZE_MIN_DELTA_PX
         ):
+            # 差分が小さいときは再生成コストを避ける
             if index == self._page_index:
                 self._show_page(index, keep_view=True)
             return
@@ -1268,10 +1276,12 @@ class ImageView(QGraphicsView):
             log_debug("ImageView _request_fullres skip no file")
             return
         if self._zoom_interacting:
+            # ズーム連打中はfullres要求を遅延してUI応答性を優先
             self._deferred_fullres_request = True
             log_debug("ImageView _request_fullres defer while zoom interacting")
             return
         if self._current_task is not None:
+            # 全ページ先読み中は同時負荷を避けるため後回し
             self._deferred_fullres_request = True
             log_debug("ImageView _request_fullres defer while preload running")
             return
@@ -1360,6 +1370,7 @@ class ImageView(QGraphicsView):
 
     @Slot(int, int)
     def _on_page_count(self, cnt: int, generation: int):
+        # 世代不一致＝古いタスクの結果なので破棄
         if generation != self._load_generation:
             log_debug(
                 "ImageView page_count stale count=%s generation=%s current_generation=%s",
@@ -1375,6 +1386,7 @@ class ImageView(QGraphicsView):
 
     @Slot(int, QImage, str, int)
     def _on_page_loaded(self, index: int, img: QImage, err: str, generation: int):
+        # 世代不一致＝古いタスクの結果なので破棄
         if generation != self._load_generation:
             log_debug(
                 "ImageView page_loaded stale index=%s generation=%s current_generation=%s",
@@ -1411,6 +1423,7 @@ class ImageView(QGraphicsView):
     @Slot(int, QImage, str, int, QSize)
     def _on_fullres_loaded(self, index: int, img: QImage, err: str, generation: int, source_size: QSize):
         self._fullres_pending_pages.discard(index)
+        # 世代不一致＝古いタスクの結果なので破棄
         if generation != self._load_generation:
             log_debug(
                 "ImageView fullres_loaded stale index=%s generation=%s current_generation=%s",
@@ -1447,6 +1460,7 @@ class ImageView(QGraphicsView):
 
     @Slot(str, int)
     def _on_finished(self, err: str, generation: int):
+        # 世代不一致＝古いタスクの完了通知なので破棄
         if generation != self._load_generation:
             log_debug(
                 "ImageView all_pages_finished stale generation=%s current_generation=%s err=%s",
@@ -1515,6 +1529,7 @@ class MainWindow(QMainWindow):
         self.act_prev_file.triggered.connect(self.open_prev_file)
 
         tb = self.addToolBar("Main")
+        # 指定順: Open, Fit, PageUp, PageDown, PrevFile, NextFile
         tb.addAction(self.act_open)
         tb.addAction(self.act_fit)
         tb.addAction(self.act_prev)
