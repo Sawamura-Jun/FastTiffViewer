@@ -27,7 +27,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.1.0"
+WINDOW_TITLE = "Fast TIFF Viewer v1.2.0"
 
 # 表示/デコード挙動の調整パラメータ
 DEFAULT_WINDOW_SIZE = (1060, 800)       # アプリ起動時の初期ウィンドウサイズ(px)
