@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QStyle,
+    QSystemTrayIcon,
 )
 import pyvips
 
@@ -1504,6 +1507,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.view.state_changed.connect(self._update_ui)
         self.view.file_dropped.connect(self._open_dropped_file)
+        self._allow_close = False
+        self._tray_available = False
+        self._tray_icon = None
+        self._tray_menu = None
+        self._tray_close_notice_shown = False
 
         self.act_open = QAction("Open", self)
         self.act_open.triggered.connect(self.open_file)
@@ -1527,6 +1535,17 @@ class MainWindow(QMainWindow):
         self.act_prev_file = QAction("PrevFile(B)", self)
         self.act_prev_file.setShortcut(Qt.Key_B)
         self.act_prev_file.triggered.connect(self.open_prev_file)
+
+        self.act_show_window = QAction("Show", self)
+        self.act_show_window.triggered.connect(self._show_main_window)
+
+        self.act_hide_window = QAction("Hide", self)
+        self.act_hide_window.triggered.connect(self._hide_to_tray)
+
+        self.act_quit = QAction("Exit", self)
+        self.act_quit.triggered.connect(self._quit_from_tray)
+
+        self._setup_tray_icon()
 
         tb = self.addToolBar("Main")
         # 指定順: Open, Fit, PageUp, PageDown, PrevFile, NextFile
@@ -1560,6 +1579,80 @@ class MainWindow(QMainWindow):
             app.setWindowIcon(icon)
         log_info("MainWindow icon applied path=%s", icon_path)
 
+    def _setup_tray_icon(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_available = False
+            log_info("MainWindow tray unavailable")
+            return
+
+        tray_icon = QIcon(self.windowIcon())
+        if tray_icon.isNull():
+            tray_icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+        self._tray_icon = QSystemTrayIcon(tray_icon, self)
+        self._tray_icon.setToolTip(WINDOW_TITLE)
+
+        menu = QMenu(self)
+        menu.addAction(self.act_show_window)
+        menu.addAction(self.act_hide_window)
+        menu.addSeparator()
+        menu.addAction(self.act_open)
+        menu.addSeparator()
+        menu.addAction(self.act_quit)
+        self._tray_menu = menu
+        self._tray_icon.setContextMenu(menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+        self._tray_available = True
+        log_info("MainWindow tray ready")
+
+    def _show_main_window(self):
+        if self.isMinimized():
+            self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        log_debug("MainWindow show_main_window")
+        self._update_ui()
+
+    def _hide_to_tray(self, show_notice: bool = False):
+        if not self._tray_available or self._tray_icon is None:
+            return
+        self.hide()
+        log_debug("MainWindow hide_to_tray")
+        if show_notice and (not self._tray_close_notice_shown) and self._tray_icon.supportsMessages():
+            self._tray_icon.showMessage(
+                WINDOW_TITLE,
+                "Fast TIFF Viewer is running in the system tray.",
+                QSystemTrayIcon.Information,
+                3000,
+            )
+            self._tray_close_notice_shown = True
+        self._update_ui()
+
+    def _quit_from_tray(self):
+        log_info("MainWindow quit requested from tray")
+        self._allow_close = True
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_tray_activated(self, reason):
+        if reason in {QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick}:
+            if self.isVisible():
+                self._hide_to_tray()
+            else:
+                self._show_main_window()
+
+    def start_in_tray(self):
+        if not self._tray_available or self._tray_icon is None:
+            self._show_main_window()
+            log_info("MainWindow start_in_tray fallback to show")
+            return
+        self._hide_to_tray()
+        log_info("MainWindow started in tray mode")
+
     def _update_ui(self):
         has_file = bool(self.view.file_path())
         pc = self.view.page_count()
@@ -1573,6 +1666,10 @@ class MainWindow(QMainWindow):
         self.act_fit.setEnabled(self.view.has_image())
         self.act_next_file.setEnabled(bool(self._neighbor_file_path(1)))
         self.act_prev_file.setEnabled(bool(self._neighbor_file_path(-1)))
+        if self._tray_available and self._tray_icon is not None:
+            visible = self.isVisible()
+            self.act_show_window.setEnabled(not visible)
+            self.act_hide_window.setEnabled(visible)
 
         if has_file:
             name = Path(self.view.file_path()).name
@@ -1588,6 +1685,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan  Mode {mode_text}")
 
     def open_file(self):
+        if not self.isVisible():
+            self._show_main_window()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open TIFF",
@@ -1622,6 +1721,7 @@ class MainWindow(QMainWindow):
             if url.isValid() and url.isLocalFile():
                 path = url.toLocalFile()
 
+        self._show_main_window()
         log_info("MainWindow cli_open path=%s", path)
         self._open_path(path)
 
@@ -1689,7 +1789,18 @@ class MainWindow(QMainWindow):
         self._update_ui()
 
     def closeEvent(self, event):
-        log_info("MainWindow closeEvent")
+        if self._allow_close:
+            log_info("MainWindow closeEvent accept (allow_close)")
+            super().closeEvent(event)
+            return
+
+        if self._tray_available and self._tray_icon is not None:
+            log_info("MainWindow closeEvent hide to tray")
+            event.ignore()
+            self._hide_to_tray(show_notice=True)
+            return
+
+        log_info("MainWindow closeEvent accept (tray unavailable)")
         super().closeEvent(event)
 
 
@@ -1698,10 +1809,16 @@ if __name__ == "__main__":
     log_info("log_file=%s", str(LOG_FILE_PATH))
     log_info("pyvips=%s libvips=%s.%s.%s", pyvips.__version__, pyvips.version(0), pyvips.version(1), pyvips.version(2))
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
 
     w = MainWindow()
     w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
-    w.show()
-    log_info("main window shown size=%sx%s", w.width(), w.height())
-    QTimer.singleShot(0, lambda: w.open_from_cli_args(sys.argv[1:]))
+    cli_args = sys.argv[1:]
+    if cli_args:
+        w.show()
+        log_info("main window shown size=%sx%s", w.width(), w.height())
+    else:
+        w.start_in_tray()
+        log_info("main start in tray (no cli args)")
+    QTimer.singleShot(0, lambda: w.open_from_cli_args(cli_args))
     sys.exit(app.exec())
