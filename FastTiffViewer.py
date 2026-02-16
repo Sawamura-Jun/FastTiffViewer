@@ -91,9 +91,9 @@ def _send_ipc_message(message: str, timeout_ms: int = 500) -> bool:
 
 
 class SingleInstanceServer(QObject):
-    def __init__(self, main_window):
-        super().__init__(main_window)
-        self._window = main_window
+    def __init__(self, message_handler, parent=None):
+        super().__init__(parent)
+        self._message_handler = message_handler
         self._server = QLocalServer(self)
         self._server.newConnection.connect(self._on_new_connection)
 
@@ -124,13 +124,8 @@ class SingleInstanceServer(QObject):
 
     def _dispatch(self, message: str):
         log_info("SingleInstanceServer received message=%s", message)
-        if message.startswith("OPEN\t"):
-            path = message[5:].strip()
-            if path:
-                self._window.open_from_cli_args([path])
-            return
-        if message == "PING":
-            return
+        if self._message_handler is not None:
+            self._message_handler(message)
 
 
 def setup_debug_logging():
@@ -1612,8 +1607,9 @@ class ImageView(QGraphicsView):
 # ---------- MainWindow ----------
 class MainWindow(QMainWindow):
     IMAGE_EXTENSIONS = {".tif", ".tiff"}
+    new_window_requested = Signal(str)
 
-    def __init__(self):
+    def __init__(self, enable_tray: bool = True):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self.setMinimumSize(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1])
@@ -1625,13 +1621,22 @@ class MainWindow(QMainWindow):
         self.view.state_changed.connect(self._update_ui)
         self.view.file_dropped.connect(self._open_dropped_file)
         self._allow_close = False
+        self._tray_enabled = bool(enable_tray)
         self._tray_available = False
         self._tray_icon = None
         self._tray_menu = None
         self._tray_close_notice_shown = False
 
+        self.act_new_window = QAction("NewWindow", self)
+        self.act_new_window.setShortcut("Ctrl+Shift+N")
+        self.act_new_window.triggered.connect(self._request_new_window)
+
         self.act_open = QAction("Open", self)
         self.act_open.triggered.connect(self.open_file)
+
+        self.act_open_new = QAction("Open(NewWindow)", self)
+        self.act_open_new.setShortcut("Ctrl+Shift+O")
+        self.act_open_new.triggered.connect(self.open_file_in_new_window)
 
         self.act_prev = QAction("PageUp", self)
         self.act_prev.setShortcut(Qt.Key_PageUp)
@@ -1662,11 +1667,14 @@ class MainWindow(QMainWindow):
         self.act_quit = QAction("Exit", self)
         self.act_quit.triggered.connect(self._quit_from_tray)
 
-        self._setup_tray_icon()
+        if self._tray_enabled:
+            self._setup_tray_icon()
 
         tb = self.addToolBar("Main")
-        # 指定順: Open, Fit, PageUp, PageDown, PrevFile, NextFile
+        # 指定順: NewWindow, Open, Open(NewWindow), Fit, PageUp, PageDown, PrevFile, NextFile
+        tb.addAction(self.act_new_window)
         tb.addAction(self.act_open)
+        tb.addAction(self.act_open_new)
         tb.addAction(self.act_fit)
         tb.addAction(self.act_prev)
         tb.addAction(self.act_next)
@@ -1697,6 +1705,8 @@ class MainWindow(QMainWindow):
         log_info("MainWindow icon applied path=%s", icon_path)
 
     def _setup_tray_icon(self):
+        if not self._tray_enabled:
+            return
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self._tray_available = False
             log_info("MainWindow tray unavailable")
@@ -1712,7 +1722,9 @@ class MainWindow(QMainWindow):
         menu.addAction(self.act_show_window)
         menu.addAction(self.act_hide_window)
         menu.addSeparator()
+        menu.addAction(self.act_new_window)
         menu.addAction(self.act_open)
+        menu.addAction(self.act_open_new)
         menu.addSeparator()
         menu.addAction(self.act_quit)
         self._tray_menu = menu
@@ -1763,7 +1775,7 @@ class MainWindow(QMainWindow):
                 self._show_main_window()
 
     def start_in_tray(self):
-        if not self._tray_available or self._tray_icon is None:
+        if (not self._tray_enabled) or (not self._tray_available) or self._tray_icon is None:
             self._show_main_window()
             log_info("MainWindow start_in_tray fallback to show")
             return
@@ -1816,6 +1828,25 @@ class MainWindow(QMainWindow):
 
         log_info("MainWindow open_file selected path=%s", path)
         self._open_path(path)
+
+    def open_file_in_new_window(self):
+        if not self.isVisible():
+            self._show_main_window()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open TIFF in New Window",
+            _default_open_directory(),
+            "TIFF Files (*.tif *.tiff)",
+        )
+        if not path:
+            log_debug("MainWindow open_file_in_new_window canceled")
+            return
+        self.new_window_requested.emit(path)
+        log_info("MainWindow requested new window path=%s", path)
+
+    def _request_new_window(self):
+        self.new_window_requested.emit("")
+        log_info("MainWindow requested new empty window")
 
     @Slot(str)
     def _open_dropped_file(self, path: str):
@@ -1924,6 +1955,70 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+class AppController(QObject):
+    def __init__(self, app):
+        super().__init__(app)
+        self._app = app
+        self._windows = []
+        self._primary_window = None
+        self._instance_server = SingleInstanceServer(self._on_ipc_message, self)
+
+    def start_single_instance_server(self):
+        self._instance_server.start()
+
+    def startup(self, cli_args):
+        self._primary_window = self._create_window(enable_tray=True)
+        self._primary_window.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
+        if cli_args:
+            self._primary_window.show()
+            log_info(
+                "AppController startup primary shown size=%sx%s",
+                self._primary_window.width(),
+                self._primary_window.height(),
+            )
+            QTimer.singleShot(0, lambda: self._primary_window.open_from_cli_args(cli_args))
+            return
+
+        self._primary_window.start_in_tray()
+        log_info("AppController startup primary started in tray")
+
+    def _create_window(self, enable_tray: bool) -> MainWindow:
+        w = MainWindow(enable_tray=enable_tray)
+        if not enable_tray:
+            w.setAttribute(Qt.WA_DeleteOnClose, True)
+        w.new_window_requested.connect(self.open_new_window)
+        w.destroyed.connect(lambda _=None, win=w: self._on_window_destroyed(win))
+        self._windows.append(w)
+        log_info("AppController window created enable_tray=%s total=%s", enable_tray, len(self._windows))
+        return w
+
+    def _on_window_destroyed(self, window):
+        for i, w in enumerate(list(self._windows)):
+            if w is window:
+                self._windows.pop(i)
+                break
+        log_info("AppController window destroyed total=%s", len(self._windows))
+
+    @Slot(str)
+    def open_new_window(self, path: str = ""):
+        normalized_path = _normalize_input_path(path) if path else ""
+        w = self._create_window(enable_tray=False)
+        w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
+        w.show()
+        log_info("AppController open_new_window path=%s", normalized_path if normalized_path else "(none)")
+        if normalized_path:
+            QTimer.singleShot(0, lambda p=normalized_path, win=w: win.open_from_cli_args([p]))
+
+    def _on_ipc_message(self, message: str):
+        if message.startswith("OPEN\t"):
+            path = _normalize_input_path(message[5:])
+            if path:
+                self.open_new_window(path)
+            return
+        if message == "PING":
+            return
+
+
 if __name__ == "__main__":
     setup_debug_logging()
     log_info("log_file=%s", str(LOG_FILE_PATH))
@@ -1937,15 +2032,7 @@ if __name__ == "__main__":
         log_info("main delegated_to_existing_instance message=%s", ipc_message)
         sys.exit(0)
 
-    w = MainWindow()
-    instance_server = SingleInstanceServer(w)
-    instance_server.start()
-    w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
-    if cli_args:
-        w.show()
-        log_info("main window shown size=%sx%s", w.width(), w.height())
-    else:
-        w.start_in_tray()
-        log_info("main start in tray (no cli args)")
-    QTimer.singleShot(0, lambda: w.open_from_cli_args(cli_args))
+    controller = AppController(app)
+    controller.start_single_instance_server()
+    controller.startup(cli_args)
     sys.exit(app.exec())
