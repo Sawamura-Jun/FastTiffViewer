@@ -1634,10 +1634,6 @@ class MainWindow(QMainWindow):
         self.act_open = QAction("Open", self)
         self.act_open.triggered.connect(self.open_file)
 
-        self.act_open_new = QAction("Open(NewWindow)", self)
-        self.act_open_new.setShortcut("Ctrl+Shift+O")
-        self.act_open_new.triggered.connect(self.open_file_in_new_window)
-
         self.act_prev = QAction("PageUp", self)
         self.act_prev.setShortcut(Qt.Key_PageUp)
         self.act_prev.triggered.connect(self.view.prev_page)
@@ -1658,12 +1654,6 @@ class MainWindow(QMainWindow):
         self.act_prev_file.setShortcut(Qt.Key_B)
         self.act_prev_file.triggered.connect(self.open_prev_file)
 
-        self.act_show_window = QAction("Show", self)
-        self.act_show_window.triggered.connect(self._show_main_window)
-
-        self.act_hide_window = QAction("Hide", self)
-        self.act_hide_window.triggered.connect(self._hide_to_tray)
-
         self.act_quit = QAction("Exit", self)
         self.act_quit.triggered.connect(self._quit_from_tray)
 
@@ -1671,10 +1661,9 @@ class MainWindow(QMainWindow):
             self._setup_tray_icon()
 
         tb = self.addToolBar("Main")
-        # 指定順: NewWindow, Open, Open(NewWindow), Fit, PageUp, PageDown, PrevFile, NextFile
-        tb.addAction(self.act_new_window)
+        # 指定順: Open, NewWindow, Fit, PageUp, PageDown, PrevFile, NextFile
         tb.addAction(self.act_open)
-        tb.addAction(self.act_open_new)
+        tb.addAction(self.act_new_window)
         tb.addAction(self.act_fit)
         tb.addAction(self.act_prev)
         tb.addAction(self.act_next)
@@ -1719,12 +1708,8 @@ class MainWindow(QMainWindow):
         self._tray_icon.setToolTip(WINDOW_TITLE)
 
         menu = QMenu(self)
-        menu.addAction(self.act_show_window)
-        menu.addAction(self.act_hide_window)
-        menu.addSeparator()
-        menu.addAction(self.act_new_window)
         menu.addAction(self.act_open)
-        menu.addAction(self.act_open_new)
+        menu.addAction(self.act_new_window)
         menu.addSeparator()
         menu.addAction(self.act_quit)
         self._tray_menu = menu
@@ -1795,10 +1780,6 @@ class MainWindow(QMainWindow):
         self.act_fit.setEnabled(self.view.has_image())
         self.act_next_file.setEnabled(bool(self._neighbor_file_path(1)))
         self.act_prev_file.setEnabled(bool(self._neighbor_file_path(-1)))
-        if self._tray_available and self._tray_icon is not None:
-            visible = self.isVisible()
-            self.act_show_window.setEnabled(not visible)
-            self.act_hide_window.setEnabled(visible)
 
         if has_file:
             name = Path(self.view.file_path()).name
@@ -1828,21 +1809,6 @@ class MainWindow(QMainWindow):
 
         log_info("MainWindow open_file selected path=%s", path)
         self._open_path(path)
-
-    def open_file_in_new_window(self):
-        if not self.isVisible():
-            self._show_main_window()
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open TIFF in New Window",
-            _default_open_directory(),
-            "TIFF Files (*.tif *.tiff)",
-        )
-        if not path:
-            log_debug("MainWindow open_file_in_new_window canceled")
-            return
-        self.new_window_requested.emit(path)
-        log_info("MainWindow requested new window path=%s", path)
 
     def _request_new_window(self):
         self.new_window_requested.emit("")
