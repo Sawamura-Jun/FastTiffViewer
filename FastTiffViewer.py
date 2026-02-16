@@ -7,6 +7,7 @@ from collections import OrderedDict
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QRunnable, QThreadPool, QRectF, QSize, QTimer, QUrl
 from PySide6.QtGui import QAction, QIcon, QImage, QPainter
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -28,6 +29,7 @@ ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in
 # 上記 "0"を"1"でlogファイル出力
 
 WINDOW_TITLE = "Fast TIFF Viewer v1.2.0"
+INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
 DEFAULT_WINDOW_SIZE = (1060, 800)       # アプリ起動時の初期ウィンドウサイズ(px)
@@ -46,6 +48,89 @@ PREVIEW_RESIZE_UPDATE_DELAY_MS = 120    # リサイズ後にプレビュー再�
 PREVIEW_RESIZE_MIN_DELTA_PX = 64        # プレビュー再生成を行う最小サイズ差分(px)
 PREVIEW_RESIZE_SMOOTH = True            # プレビュー再生成時に滑らか補間を使うか
 PREVIEW_RESIZE_TARGET_SCALE = 1.0       # プレビュー再生成時の目標倍率（ビューポート基準）
+
+
+def _normalize_input_path(path_text: str) -> str:
+    path = str(path_text).strip().strip('"')
+    if not path:
+        return ""
+
+    # PyInstaller 経由の関連付け起動で file:// 形式が来るケースにも対応
+    if path.lower().startswith("file://"):
+        url = QUrl(path)
+        if url.isValid() and url.isLocalFile():
+            path = url.toLocalFile()
+    return path
+
+
+def _build_ipc_message(args) -> str:
+    if not args:
+        return "PING"
+    path = _normalize_input_path(args[0])
+    if path:
+        return f"OPEN\t{path}"
+    return "PING"
+
+
+def _send_ipc_message(message: str, timeout_ms: int = 500) -> bool:
+    sock = QLocalSocket()
+    sock.connectToServer(INSTANCE_SERVER_NAME)
+    if not sock.waitForConnected(timeout_ms):
+        return False
+
+    payload = (message + "\n").encode("utf-8", errors="ignore")
+    sock.write(payload)
+    if not sock.waitForBytesWritten(timeout_ms):
+        sock.abort()
+        return False
+
+    sock.flush()
+    sock.disconnectFromServer()
+    sock.waitForDisconnected(timeout_ms)
+    return True
+
+
+class SingleInstanceServer(QObject):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self._window = main_window
+        self._server = QLocalServer(self)
+        self._server.newConnection.connect(self._on_new_connection)
+
+    def start(self) -> bool:
+        QLocalServer.removeServer(INSTANCE_SERVER_NAME)
+        ok = self._server.listen(INSTANCE_SERVER_NAME)
+        if ok:
+            log_info("SingleInstanceServer listening name=%s", INSTANCE_SERVER_NAME)
+        else:
+            log_info("SingleInstanceServer listen failed name=%s err=%s", INSTANCE_SERVER_NAME, self._server.errorString())
+        return ok
+
+    def _on_new_connection(self):
+        while self._server.hasPendingConnections():
+            sock = self._server.nextPendingConnection()
+            if sock is None:
+                continue
+            sock.readyRead.connect(lambda s=sock: self._on_socket_ready_read(s))
+            sock.disconnected.connect(sock.deleteLater)
+
+    def _on_socket_ready_read(self, sock):
+        raw = bytes(sock.readAll()).decode("utf-8", errors="ignore")
+        for line in raw.splitlines():
+            message = line.strip()
+            if not message:
+                continue
+            self._dispatch(message)
+
+    def _dispatch(self, message: str):
+        log_info("SingleInstanceServer received message=%s", message)
+        if message.startswith("OPEN\t"):
+            path = message[5:].strip()
+            if path:
+                self._window.open_from_cli_args([path])
+            return
+        if message == "PING":
+            return
 
 
 def setup_debug_logging():
@@ -633,6 +718,38 @@ class ImageView(QGraphicsView):
         self.state_changed.emit()
         log_info("ImageView load_file queued generation=%s", self._load_generation)
         return True
+
+    def clear_document(self):
+        had_file = bool(self._file_path)
+        self._load_generation += 1
+        if self._current_task is not None:
+            self._current_task.cancel()
+            self._current_task = None
+            log_debug("ImageView clear_document cancel current preload task")
+
+        self._file_path = ""
+        self._page_index = 0
+        self._requested_page = 0
+        self._page_count = 0
+        self._last_error = ""
+        self._loaded_pages.clear()
+        self._image_cache.clear()
+        self._fullres_cache.clear()
+        self._fullres_pending_pages.clear()
+        self._deferred_fullres_request = False
+        self._zoom_interacting = False
+        self._page_source_sizes.clear()
+        self._mipmap_cache.clear()
+        self._idle_fullres_timer.stop()
+        self._zoom_interaction_timer.stop()
+        self._preview_resize_timer.stop()
+
+        self.resetTransform()
+        self._fit_mode = True
+        self._item.set_image(QImage())
+        self._scene.setSceneRect(self._item.boundingRect())
+        self.state_changed.emit()
+        log_info("ImageView clear_document done had_file=%s generation=%s", had_file, self._load_generation)
 
     def set_page(self, index: int) -> bool:
         if not self._file_path:
@@ -1710,16 +1827,10 @@ class MainWindow(QMainWindow):
             log_debug("MainWindow cli_open no args")
             return
 
-        path = str(args[0]).strip().strip('"')
+        path = _normalize_input_path(args[0])
         if not path:
             log_debug("MainWindow cli_open empty first arg")
             return
-
-        # PyInstaller 経由の関連付け起動で file:// 形式が来るケースにも対応
-        if path.lower().startswith("file://"):
-            url = QUrl(path)
-            if url.isValid() and url.isLocalFile():
-                path = url.toLocalFile()
 
         self._show_main_window()
         log_info("MainWindow cli_open path=%s", path)
@@ -1788,6 +1899,14 @@ class MainWindow(QMainWindow):
             log_info("MainWindow open_path success path=%s", path)
         self._update_ui()
 
+    def _clear_loaded_image_state(self):
+        had_file = bool(self.view.file_path())
+        self.view.clear_document()
+        self._dir_files = []
+        self._dir_file_index = -1
+        self._update_ui()
+        log_info("MainWindow clear_loaded_image_state had_file=%s", had_file)
+
     def closeEvent(self, event):
         if self._allow_close:
             log_info("MainWindow closeEvent accept (allow_close)")
@@ -1797,6 +1916,7 @@ class MainWindow(QMainWindow):
         if self._tray_available and self._tray_icon is not None:
             log_info("MainWindow closeEvent hide to tray")
             event.ignore()
+            self._clear_loaded_image_state()
             self._hide_to_tray(show_notice=True)
             return
 
@@ -1811,9 +1931,16 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    w = MainWindow()
-    w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
     cli_args = sys.argv[1:]
+    ipc_message = _build_ipc_message(cli_args)
+    if _send_ipc_message(ipc_message):
+        log_info("main delegated_to_existing_instance message=%s", ipc_message)
+        sys.exit(0)
+
+    w = MainWindow()
+    instance_server = SingleInstanceServer(w)
+    instance_server.start()
+    w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
     if cli_args:
         w.show()
         log_info("main window shown size=%sx%s", w.width(), w.height())
