@@ -12,3 +12,11 @@ release/
 # Compile data
 __pycache__
 *.pyc
+
+# .NET build artifacts
+**/bin/
+**/obj/
+FastTiffViewerLauncher/pub_*/
+
+# (任意) デバッグシンボル
+*.pdb
