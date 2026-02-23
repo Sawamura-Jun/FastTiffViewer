@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import time
+import gc
 from pathlib import Path
 from collections import OrderedDict
 
@@ -28,7 +29,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.2.2"
+WINDOW_TITLE = "Fast TIFF Viewer v1.2.3"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -48,6 +49,7 @@ PREVIEW_RESIZE_UPDATE_DELAY_MS = 120    # リサイズ後にプレビュー再�
 PREVIEW_RESIZE_MIN_DELTA_PX = 64        # プレビュー再生成を行う最小サイズ差分(px)
 PREVIEW_RESIZE_SMOOTH = True            # プレビュー再生成時に滑らか補間を使うか
 PREVIEW_RESIZE_TARGET_SCALE = 1.0       # プレビュー再生成時の目標倍率（ビューポート基準）
+WORKER_DRAIN_TIMEOUT_MS = 3000          # ファイル切替/解放時にバックグラウンド処理完了を待つ上限(ms)
 
 
 def _normalize_input_path(path_text: str) -> str:
@@ -231,6 +233,24 @@ def _default_open_directory() -> str:
 def _vips_error_text(exc: Exception) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def _drop_vips_caches():
+    dropped = False
+    try:
+        drop_fn = getattr(pyvips, "cache_drop_all", None)
+        if callable(drop_fn):
+            drop_fn()
+            dropped = True
+        else:
+            vop = getattr(pyvips, "voperation", None)
+            drop_fn = getattr(vop, "cache_drop_all", None) if vop is not None else None
+            if callable(drop_fn):
+                drop_fn()
+                dropped = True
+    except Exception as e:
+        log_debug("pyvips cache_drop_all failed err=%s", e)
+    return dropped
 
 
 def _move_window_center_to_cursor(window):
@@ -683,6 +703,43 @@ class ImageView(QGraphicsView):
             self._fullres_pool.maxThreadCount(),
         )
 
+    def _stop_background_tasks(
+        self,
+        reason: str,
+        wait_for_done: bool,
+        wait_timeout_ms: int = WORKER_DRAIN_TIMEOUT_MS,
+    ):
+        if self._current_task is not None:
+            self._current_task.cancel()
+            self._current_task = None
+            log_debug("ImageView stop_background_tasks cancel preload reason=%s", reason)
+
+        self._idle_fullres_timer.stop()
+        self._zoom_interaction_timer.stop()
+        self._preview_resize_timer.stop()
+        self._fullres_pending_pages.clear()
+        self._deferred_fullres_request = False
+        self._zoom_interacting = False
+
+        self._pool.clear()
+        self._fullres_pool.clear()
+
+        if wait_for_done:
+            preload_done = self._pool.waitForDone(wait_timeout_ms)
+            fullres_done = self._fullres_pool.waitForDone(wait_timeout_ms)
+            if preload_done is False or fullres_done is False:
+                log_info(
+                    "ImageView stop_background_tasks timeout reason=%s preload_done=%s fullres_done=%s",
+                    reason,
+                    preload_done,
+                    fullres_done,
+                )
+
+        dropped = _drop_vips_caches()
+        if dropped:
+            gc.collect()
+            log_debug("ImageView stop_background_tasks dropped_vips_cache reason=%s", reason)
+
     def file_path(self):
         return self._file_path
 
@@ -722,9 +779,7 @@ class ImageView(QGraphicsView):
     def load_file(self, file_path: str) -> bool:
         log_info("ImageView load_file start file=%s", file_path)
         self._load_generation += 1
-        if self._current_task is not None:
-            self._current_task.cancel()
-            log_debug("ImageView load_file cancel previous task")
+        self._stop_background_tasks("load_file", wait_for_done=True)
         self._file_path = file_path
         self._page_index = 0
         self._requested_page = 0
@@ -738,9 +793,6 @@ class ImageView(QGraphicsView):
         self._zoom_interacting = False
         self._page_source_sizes.clear()
         self._mipmap_cache.clear()
-        self._idle_fullres_timer.stop()
-        self._zoom_interaction_timer.stop()
-        self._preview_resize_timer.stop()
         log_debug(
             "ImageView load_file reset generation=%s preview_target=%s",
             self._load_generation,
@@ -762,10 +814,7 @@ class ImageView(QGraphicsView):
     def clear_document(self):
         had_file = bool(self._file_path)
         self._load_generation += 1
-        if self._current_task is not None:
-            self._current_task.cancel()
-            self._current_task = None
-            log_debug("ImageView clear_document cancel current preload task")
+        self._stop_background_tasks("clear_document", wait_for_done=True, wait_timeout_ms=-1)
 
         self._file_path = ""
         self._page_index = 0
@@ -780,9 +829,6 @@ class ImageView(QGraphicsView):
         self._zoom_interacting = False
         self._page_source_sizes.clear()
         self._mipmap_cache.clear()
-        self._idle_fullres_timer.stop()
-        self._zoom_interaction_timer.stop()
-        self._preview_resize_timer.stop()
 
         self.resetTransform()
         self._fit_mode = True
@@ -1951,6 +1997,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self._allow_close:
+            self._clear_loaded_image_state()
             log_info("MainWindow closeEvent accept (allow_close)")
             super().closeEvent(event)
             return
@@ -1963,6 +2010,7 @@ class MainWindow(QMainWindow):
             return
 
         log_info("MainWindow closeEvent accept (tray unavailable)")
+        self._clear_loaded_image_state()
         super().closeEvent(event)
 
 
