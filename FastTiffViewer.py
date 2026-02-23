@@ -6,7 +6,7 @@ from pathlib import Path
 from collections import OrderedDict
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QRunnable, QThreadPool, QRectF, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QIcon, QImage, QPainter
+from PySide6.QtGui import QAction, QCursor, QGuiApplication, QIcon, QImage, QPainter
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -85,8 +85,10 @@ def _send_ipc_message(message: str, timeout_ms: int = 500) -> bool:
         return False
 
     sock.flush()
-    sock.disconnectFromServer()
-    sock.waitForDisconnected(timeout_ms)
+    if sock.state() != QLocalSocket.UnconnectedState:
+        sock.disconnectFromServer()
+        if sock.state() != QLocalSocket.UnconnectedState:
+            sock.waitForDisconnected(timeout_ms)
     return True
 
 
@@ -229,6 +231,49 @@ def _default_open_directory() -> str:
 def _vips_error_text(exc: Exception) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def _move_window_center_to_cursor(window):
+    if window is None:
+        return
+
+    cursor_pos = QCursor.pos()
+    screen = QGuiApplication.screenAt(cursor_pos)
+    if screen is None:
+        screen = window.screen()
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    if screen is None:
+        return
+
+    available = screen.availableGeometry()
+    if available.isNull():
+        return
+
+    frame = window.frameGeometry()
+    geom = window.geometry()
+
+    frame_w = frame.width()
+    frame_h = frame.height()
+    if frame_w <= 0 or frame_h <= 0:
+        frame_w = max(1, geom.width())
+        frame_h = max(1, geom.height())
+
+    frame_offset_x = frame.x() - geom.x()
+    frame_offset_y = frame.y() - geom.y()
+
+    target_frame_x = cursor_pos.x() - (frame_w // 2)
+    target_frame_y = cursor_pos.y() - (frame_h // 2)
+
+    min_frame_x = available.x()
+    min_frame_y = available.y()
+    max_frame_x = available.x() + max(0, available.width() - frame_w)
+    max_frame_y = available.y() + max(0, available.height() - frame_h)
+
+    clamped_frame_x = max(min_frame_x, min(target_frame_x, max_frame_x))
+    clamped_frame_y = max(min_frame_y, min(target_frame_y, max_frame_y))
+
+    window.move(clamped_frame_x - frame_offset_x, clamped_frame_y - frame_offset_y)
 
 
 def _scale_to_fit(source_size: QSize, max_size: QSize) -> QSize:
@@ -1936,6 +1981,7 @@ class AppController(QObject):
         self._primary_window = self._create_window(enable_tray=True)
         self._primary_window.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
         if cli_args:
+            _move_window_center_to_cursor(self._primary_window)
             self._primary_window.show()
             log_info(
                 "AppController startup primary shown size=%sx%s",
@@ -1970,6 +2016,7 @@ class AppController(QObject):
         normalized_path = _normalize_input_path(path) if path else ""
         w = self._create_window(enable_tray=False)
         w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
+        _move_window_center_to_cursor(w)
         w.show()
         log_info("AppController open_new_window path=%s", normalized_path if normalized_path else "(none)")
         if normalized_path:
