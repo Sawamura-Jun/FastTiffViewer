@@ -17,6 +17,10 @@ __pycache__
 **/bin/
 **/obj/
 FastTiffViewerLauncher/pub_*/
+*.sln
 
 # (任意) デバッグシンボル
 *.pdb
+
+# その他
+AGENTS.md

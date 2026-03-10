@@ -230,6 +230,57 @@ def _default_open_directory() -> str:
     return str(Path.home())
 
 
+def _safe_process_cwd() -> Path:
+    candidates = []
+
+    exe_path = Path(sys.executable).resolve()
+    if exe_path.exists():
+        candidates.append(exe_path.parent)
+
+    script_dir = Path(__file__).resolve().parent
+    candidates.append(script_dir)
+
+    candidates.append(Path.home())
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_dir():
+                return p
+        except OSError:
+            continue
+    return Path.home()
+
+
+def _pin_process_cwd(reason: str) -> bool:
+    try:
+        before = Path.cwd()
+    except OSError:
+        before = None
+
+    target = _safe_process_cwd()
+    try:
+        os.chdir(target)
+    except OSError as e:
+        log_info(
+            "process_cwd pin failed reason=%s target=%s err=%s",
+            reason,
+            str(target),
+            e,
+        )
+        return False
+
+    try:
+        after = Path.cwd()
+    except OSError:
+        after = target
+
+    if before != after:
+        log_info("process_cwd updated reason=%s before=%s after=%s", reason, str(before), str(after))
+    else:
+        log_debug("process_cwd unchanged reason=%s cwd=%s", reason, str(after))
+    return True
+
+
 def _vips_error_text(exc: Exception) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
@@ -1888,12 +1939,15 @@ class MainWindow(QMainWindow):
     def open_file(self):
         if not self.isVisible():
             self._show_main_window()
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open TIFF",
-            _default_open_directory(),
-            "TIFF Files (*.tif *.tiff)",
-        )
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Open TIFF",
+                _default_open_directory(),
+                "TIFF Files (*.tif *.tiff)",
+            )
+        finally:
+            _pin_process_cwd("open_file_dialog")
         if not path:
             log_debug("MainWindow open_file canceled")
             return
@@ -2084,6 +2138,7 @@ if __name__ == "__main__":
     setup_debug_logging()
     log_info("log_file=%s", str(LOG_FILE_PATH))
     log_info("pyvips=%s libvips=%s.%s.%s", pyvips.__version__, pyvips.version(0), pyvips.version(1), pyvips.version(2))
+    _pin_process_cwd("process_start")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
