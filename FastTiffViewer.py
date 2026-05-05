@@ -6,8 +6,23 @@ import gc
 from pathlib import Path
 from collections import OrderedDict
 
-from PySide6.QtCore import Qt, QObject, Signal, Slot, QRunnable, QThreadPool, QRectF, QSize, QTimer, QUrl
-from PySide6.QtGui import QAction, QCursor, QGuiApplication, QIcon, QImage, QPainter
+from PySide6.QtCore import (
+    Qt,
+    QObject,
+    Signal,
+    Slot,
+    QRunnable,
+    QThreadPool,
+    QByteArray,
+    QMimeData,
+    QPointF,
+    QRectF,
+    QSize,
+    QStandardPaths,
+    QTimer,
+    QUrl,
+)
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QGuiApplication, QIcon, QImage, QPainter, QPen
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +33,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QLabel,
+    QLineEdit,
     QStyle,
     QSystemTrayIcon,
 )
@@ -50,6 +67,12 @@ PREVIEW_RESIZE_MIN_DELTA_PX = 64        # プレビュー再生成を行う最�
 PREVIEW_RESIZE_SMOOTH = True            # プレビュー再生成時に滑らか補間を使うか
 PREVIEW_RESIZE_TARGET_SCALE = 1.0       # プレビュー再生成時の目標倍率（ビューポート基準）
 WORKER_DRAIN_TIMEOUT_MS = 3000          # ファイル切替/解放時にバックグラウンド処理完了を待つ上限(ms)
+CROP_BORDER_WIDTH_PX = 2.0              # トリミング枠の線幅(px)
+CROP_HANDLE_SIZE_PX = 9.0               # トリミング枠ハンドルの表示サイズ(px)
+CROP_EDGE_GRAB_WIDTH_PX = 10.0          # トリミング枠の辺をつかめる幅(px)
+CROP_DRAG_START_DISTANCE_PX = 3         # クリック保存とDnD操作を分ける移動距離(px)
+CROP_MIN_SIZE_PX = 2.0                  # トリミング保存を許可する最小サイズ(表示画像px)
+CROP_SAVE_TEXT_MIN_WIDTH = 340          # 保存先テキストボックスの最小幅(px)
 
 
 def _normalize_input_path(path_text: str) -> str:
@@ -228,6 +251,99 @@ def _default_open_directory() -> str:
         if p.exists() and p.is_dir():
             return str(p)
     return str(Path.home())
+
+
+def _default_pictures_directory() -> Path:
+    candidates = []
+
+    qt_pictures = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+    if qt_pictures:
+        candidates.append(Path(qt_pictures))
+
+    if os.name == "nt":
+        one_drive = os.environ.get("OneDrive")
+        user_profile = os.environ.get("USERPROFILE")
+        if one_drive:
+            candidates.append(Path(one_drive) / "Pictures")
+        if user_profile:
+            candidates.append(Path(user_profile) / "Pictures")
+
+    candidates.append(Path.home() / "Pictures")
+    candidates.append(Path.home())
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_dir():
+                return p
+        except OSError:
+            continue
+    return Path.home()
+
+
+def _default_crop_save_text() -> str:
+    # デフォルトはピクチャフォルダをディレクトリ指定として扱えるよう末尾区切りを付ける
+    return str(_default_pictures_directory()) + os.sep
+
+
+def _crop_timestamp_text() -> str:
+    seconds = time.strftime("%Y%m%d_%H%M%S")
+    millis = int((time.time() % 1.0) * 1000.0)
+    return f"{seconds}_{millis:03d}"
+
+
+def _timestamped_crop_name(original_file_path: str, timestamp: str) -> str:
+    original = Path(original_file_path)
+    suffix = original.suffix or ".tif"
+    return f"{original.stem}_{timestamp}{suffix}"
+
+
+def _crop_text_has_trailing_separator(text: str) -> bool:
+    cleaned = str(text or "").strip().strip('"')
+    return bool(cleaned) and cleaned.endswith(("\\", "/"))
+
+
+def _with_original_image_suffix(path: Path, original_suffix: str) -> Path:
+    suffix = original_suffix or ".tif"
+    current = path.suffix.lower()
+
+    if not current:
+        return path.with_suffix(suffix)
+
+    # TIFF内の拡張子差だけは同一形式として許可する
+    if suffix.lower() in {".tif", ".tiff"} and current in {".tif", ".tiff"}:
+        return path
+
+    if current != suffix.lower():
+        return path.with_suffix(suffix)
+    return path
+
+
+def _resolve_crop_save_path(original_file_path: str, save_text: str, timestamp: str = "") -> Path:
+    original = Path(original_file_path)
+    original_suffix = original.suffix or ".tif"
+    ts = timestamp or _crop_timestamp_text()
+    raw = str(save_text or "").strip().strip('"')
+
+    if not raw:
+        return original.parent / _timestamped_crop_name(original_file_path, ts)
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    target = Path(expanded)
+    is_directory_target = _crop_text_has_trailing_separator(raw)
+    if not is_directory_target:
+        try:
+            is_directory_target = target.exists() and target.is_dir()
+        except OSError:
+            is_directory_target = False
+
+    if is_directory_target:
+        return target / _timestamped_crop_name(original_file_path, ts)
+
+    # パスが省略されたファイル名だけの指定は、元画像と同じフォルダへ保存する
+    if target.parent == Path("."):
+        target = original.parent / target.name
+
+    return _with_original_image_suffix(target, original_suffix)
 
 
 def _safe_process_cwd() -> Path:
@@ -526,6 +642,32 @@ class ImageItem(QGraphicsItem):
         )
 
 
+def _crop_handle_rects(rect: QRectF, handle_size: float) -> dict:
+    rect = rect.normalized()
+    if rect.isNull():
+        return {}
+
+    h = min(max(1.0, handle_size), max(1.0, rect.width()), max(1.0, rect.height()))
+    half = h / 2.0
+    left = rect.left()
+    right = rect.right()
+    top = rect.top()
+    bottom = rect.bottom()
+    cx = rect.center().x()
+    cy = rect.center().y()
+
+    return {
+        "top_left": QRectF(left, top, h, h),
+        "top": QRectF(cx - half, top, h, h),
+        "top_right": QRectF(right - h, top, h, h),
+        "right": QRectF(right - h, cy - half, h, h),
+        "bottom_right": QRectF(right - h, bottom - h, h, h),
+        "bottom": QRectF(cx - half, bottom - h, h, h),
+        "bottom_left": QRectF(left, bottom - h, h, h),
+        "left": QRectF(left, cy - half, h, h),
+    }
+
+
 # ---------- Worker: sequentially decode ALL pages once ----------
 class AllPagesLoadSignals(QObject):
     loaded = Signal(int, QImage, str, int)   # (index, image, error, generation)
@@ -688,6 +830,7 @@ class FullResPageTask(QRunnable):
 class ImageView(QGraphicsView):
     state_changed = Signal()
     file_dropped = Signal(str)
+    crop_save_requested = Signal()
 
     def __init__(self, parent=None):
 
@@ -705,8 +848,10 @@ class ImageView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        self.viewport().setMouseTracking(True)
         self._fit_mode = True
 
         # document state
@@ -723,6 +868,15 @@ class ImageView(QGraphicsView):
         self._page_source_sizes = {}  # page -> QSize(original source size)
         self._mipmap_cache = OrderedDict()  # page -> {level: QImage}
         self.max_mipmap_cache_pages = 16
+
+        # トリミング操作状態
+        self._crop_view_rect = QRectF()
+        self._right_crop_start_view = None
+        self._right_crop_started = False
+        self._right_press_view_pos = None
+        self._left_crop_mode = ""
+        self._left_crop_start_rect = QRectF()
+        self._left_press_view_pos = None
 
         # loading progress
         self._loaded_pages = set()
@@ -827,10 +981,257 @@ class ImageView(QGraphicsView):
 
         return "(-,-)"
 
+    def crop_selection_rect(self) -> QRectF:
+        return self._crop_view_rect_to_scene_rect(self._crop_view_rect)
+
+    def save_crop_to_file(self, output_path: str):
+        if not self._file_path:
+            return False, "", "トリミング失敗: 画像が開かれていません"
+
+        image_bounds = self._item.boundingRect()
+        crop_rect = self.crop_selection_rect()
+        if image_bounds.isNull() or not self._crop_rect_is_usable(crop_rect):
+            return False, "", "トリミング失敗: 範囲が選択されていません"
+
+        target_path = Path(output_path)
+        try:
+            if target_path.parent != Path("."):
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return False, str(target_path), f"トリミング失敗: 保存先フォルダを作成できません ({e})"
+
+        try:
+            vips_img = pyvips.Image.new_from_file(
+                self._file_path,
+                access="random",
+                autorotate=True,
+                page=self._page_index,
+                n=1,
+            )
+
+            scale_x = vips_img.width / max(1.0, image_bounds.width())
+            scale_y = vips_img.height / max(1.0, image_bounds.height())
+            left = crop_rect.left() - image_bounds.left()
+            top = crop_rect.top() - image_bounds.top()
+            right = crop_rect.right() - image_bounds.left()
+            bottom = crop_rect.bottom() - image_bounds.top()
+
+            crop_x0 = int(round(left * scale_x))
+            crop_y0 = int(round(top * scale_y))
+            crop_x1 = int(round(right * scale_x))
+            crop_y1 = int(round(bottom * scale_y))
+            crop_x0 = min(max(0, crop_x0), max(0, vips_img.width - 1))
+            crop_y0 = min(max(0, crop_y0), max(0, vips_img.height - 1))
+            crop_x1 = min(max(crop_x0 + 1, crop_x1), vips_img.width)
+            crop_y1 = min(max(crop_y0 + 1, crop_y1), vips_img.height)
+
+            cropped = vips_img.crop(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0)
+            cropped.write_to_file(str(target_path))
+        except Exception as e:
+            return False, str(target_path), f"トリミング失敗: {_vips_error_text(e)}"
+
+        try:
+            self._copy_vips_image_to_clipboard_png(cropped)
+        except Exception as e:
+            return True, str(target_path), f"保存完了: {target_path}  クリップボードコピー失敗: {_vips_error_text(e)}"
+
+        return True, str(target_path), f"保存完了: {target_path}  クリップボード: PNG"
+
+    def _copy_vips_image_to_clipboard_png(self, vips_img: pyvips.Image):
+        # クリップボードにはPNG MIMEとQt画像データの両方を載せ、貼り付け先の互換性を上げる
+        png_bytes = vips_img.write_to_buffer(".png")
+        data = QByteArray(bytes(png_bytes))
+        mime = QMimeData()
+        mime.setData("image/png", data)
+        qimg = QImage.fromData(data, "PNG")
+        if not qimg.isNull():
+            mime.setImageData(qimg)
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            raise RuntimeError("clipboard is unavailable")
+        # offscreen検証環境ではQMimeData所有権の終了処理で落ちるため、画像データ設定にフォールバックする
+        if QGuiApplication.platformName().lower() == "offscreen" and not qimg.isNull():
+            clipboard.setImage(qimg)
+            return
+        clipboard.setMimeData(mime)
+
+    def _image_bounds(self) -> QRectF:
+        return self._item.boundingRect()
+
+    def _image_view_bounds(self) -> QRectF:
+        bounds = self._image_bounds()
+        if bounds.isNull():
+            return QRectF()
+        return QRectF(self.mapFromScene(bounds).boundingRect())
+
+    def _crop_view_bounds(self) -> QRectF:
+        image_view_bounds = self._image_view_bounds()
+        if image_view_bounds.isNull():
+            return QRectF()
+        return image_view_bounds.intersected(QRectF(self.viewport().rect()))
+
+    def _clamp_view_pos_to_image(self, view_pos: QPointF) -> QPointF:
+        bounds = self._crop_view_bounds()
+        if bounds.isNull():
+            return QPointF(view_pos)
+        return QPointF(
+            min(max(view_pos.x(), bounds.left()), bounds.right()),
+            min(max(view_pos.y(), bounds.top()), bounds.bottom()),
+        )
+
+    def _normalize_crop_rect(self, rect: QRectF) -> QRectF:
+        bounds = self._crop_view_bounds()
+        if bounds.isNull():
+            return QRectF()
+        return QRectF(rect).normalized().intersected(bounds)
+
+    def _crop_rect_is_usable(self, rect: QRectF) -> bool:
+        return (not rect.isNull()) and rect.width() >= CROP_MIN_SIZE_PX and rect.height() >= CROP_MIN_SIZE_PX
+
+    def _set_crop_rect(self, rect: QRectF):
+        normalized = self._normalize_crop_rect(rect)
+        if normalized.isNull():
+            self._crop_view_rect = QRectF()
+            self.viewport().update()
+            return
+        self._crop_view_rect = normalized
+        self.viewport().update()
+
+    def _clear_crop_selection(self):
+        self._crop_view_rect = QRectF()
+        self._right_crop_start_view = None
+        self._right_crop_started = False
+        self._right_press_view_pos = None
+        self._left_crop_mode = ""
+        self._left_press_view_pos = None
+        self.viewport().unsetCursor()
+        self.viewport().update()
+
+    def _crop_view_rect_to_scene_rect(self, view_rect: QRectF) -> QRectF:
+        image_bounds = self._image_bounds()
+        rect = QRectF(view_rect).normalized()
+        if image_bounds.isNull() or rect.isNull():
+            return QRectF()
+
+        top_left = self.mapToScene(rect.topLeft().toPoint())
+        bottom_right = self.mapToScene(rect.bottomRight().toPoint())
+        return QRectF(top_left, bottom_right).normalized().intersected(image_bounds)
+
+    def _crop_hit_test(self, view_pos: QPointF) -> str:
+        crop_rect = QRectF(self._crop_view_rect).normalized()
+        if crop_rect.isNull():
+            return ""
+
+        for name, handle_rect in _crop_handle_rects(crop_rect, CROP_HANDLE_SIZE_PX).items():
+            if handle_rect.contains(view_pos):
+                return name
+
+        edge = CROP_EDGE_GRAB_WIDTH_PX
+        half = edge / 2.0
+        left = crop_rect.left()
+        right = crop_rect.right()
+        top = crop_rect.top()
+        bottom = crop_rect.bottom()
+        width = crop_rect.width()
+        height = crop_rect.height()
+
+        if QRectF(left, top - half, width, edge).contains(view_pos):
+            return "top"
+        if QRectF(left, bottom - half, width, edge).contains(view_pos):
+            return "bottom"
+        if QRectF(left - half, top, edge, height).contains(view_pos):
+            return "left"
+        if QRectF(right - half, top, edge, height).contains(view_pos):
+            return "right"
+        if crop_rect.contains(view_pos):
+            return "inside"
+        return ""
+
+    def _cursor_for_crop_hit(self, hit: str):
+        if hit in {"top_left", "bottom_right"}:
+            return Qt.SizeFDiagCursor
+        if hit in {"top_right", "bottom_left"}:
+            return Qt.SizeBDiagCursor
+        if hit in {"left", "right"}:
+            return Qt.SizeHorCursor
+        if hit in {"top", "bottom"}:
+            return Qt.SizeVerCursor
+        if hit == "inside":
+            return Qt.PointingHandCursor
+        return None
+
+    def _update_crop_cursor(self, view_pos):
+        if self._left_crop_mode or self._right_crop_start_view is not None:
+            return
+        hit = self._crop_hit_test(QPointF(view_pos))
+        cursor = self._cursor_for_crop_hit(hit)
+        if cursor is None:
+            self.viewport().unsetCursor()
+        else:
+            self.viewport().setCursor(cursor)
+
+    def _mouse_moved_far(self, start_pos, current_pos) -> bool:
+        if start_pos is None:
+            return False
+        distance = (current_pos - start_pos).manhattanLength()
+        threshold = max(0, int(CROP_DRAG_START_DISTANCE_PX))
+        if threshold <= 0:
+            return distance > 0
+        return distance >= threshold
+
+    def _move_crop_rect_by_delta(self, start_rect: QRectF, delta: QPointF) -> QRectF:
+        rect = QRectF(start_rect).normalized()
+        if rect.isNull():
+            return QRectF()
+
+        moved = rect.translated(delta)
+        bounds = self._crop_view_bounds()
+        if bounds.isNull():
+            return moved
+
+        # ラバーバンド全体が画像表示範囲内に残るよう、移動後の位置を補正する
+        if moved.width() <= bounds.width():
+            if moved.left() < bounds.left():
+                moved.moveLeft(bounds.left())
+            if moved.right() > bounds.right():
+                moved.moveRight(bounds.right())
+        else:
+            moved.moveLeft(bounds.left())
+
+        if moved.height() <= bounds.height():
+            if moved.top() < bounds.top():
+                moved.moveTop(bounds.top())
+            if moved.bottom() > bounds.bottom():
+                moved.moveBottom(bounds.bottom())
+        else:
+            moved.moveTop(bounds.top())
+
+        return moved
+
+    def _adjust_crop_rect(self, mode: str, view_pos: QPointF) -> QRectF:
+        pos = self._clamp_view_pos_to_image(view_pos)
+        rect = QRectF(self._left_crop_start_rect).normalized()
+        left = rect.left()
+        right = rect.right()
+        top = rect.top()
+        bottom = rect.bottom()
+
+        if "left" in mode:
+            left = pos.x()
+        if "right" in mode:
+            right = pos.x()
+        if "top" in mode:
+            top = pos.y()
+        if "bottom" in mode:
+            bottom = pos.y()
+
+        return QRectF(QPointF(left, top), QPointF(right, bottom)).normalized()
+
     def load_file(self, file_path: str) -> bool:
         log_info("ImageView load_file start file=%s", file_path)
         self._load_generation += 1
         self._stop_background_tasks("load_file", wait_for_done=True)
+        self._clear_crop_selection()
         self._file_path = file_path
         self._page_index = 0
         self._requested_page = 0
@@ -866,6 +1267,7 @@ class ImageView(QGraphicsView):
         had_file = bool(self._file_path)
         self._load_generation += 1
         self._stop_background_tasks("clear_document", wait_for_done=True, wait_timeout_ms=-1)
+        self._clear_crop_selection()
 
         self._file_path = ""
         self._page_index = 0
@@ -895,6 +1297,8 @@ class ImageView(QGraphicsView):
         if self._page_count > 0 and (index < 0 or index >= self._page_count):
             log_debug("ImageView set_page out_of_range index=%s page_count=%s", index, self._page_count)
             return False
+        if index != self._page_index:
+            self._clear_crop_selection()
 
         self._requested_page = index
         log_info(
@@ -947,6 +1351,30 @@ class ImageView(QGraphicsView):
         self._schedule_preview_resize_update()
         if self.has_image():
             self._schedule_fullres_upgrade(FULLRES_AFTER_RESIZE_DELAY_MS)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        self._paint_crop_rubber_band()
+
+    def _paint_crop_rubber_band(self):
+        rect = QRectF(self._crop_view_rect).normalized()
+        if rect.isNull():
+            return
+
+        painter = QPainter(self.viewport())
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(0, 120, 215), CROP_BORDER_WIDTH_PX, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(rect)
+
+        handle_pen_width = max(1.0, CROP_BORDER_WIDTH_PX * 0.5)
+        painter.setPen(QPen(QColor(0, 80, 160), handle_pen_width))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
+        for handle_rect in _crop_handle_rects(rect, CROP_HANDLE_SIZE_PX).values():
+            painter.drawRect(handle_rect)
+        painter.restore()
+        painter.end()
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
@@ -1188,10 +1616,115 @@ class ImageView(QGraphicsView):
             "yes" if keep_scene_center is not None else "no",
         )
 
+    def mousePressEvent(self, event):
+        view_pos = event.position()
+
+        if event.button() == Qt.RightButton:
+            # 右クリックは既存のトリミング枠を消し、ドラッグ時だけ新しい枠を作る
+            self._clear_crop_selection()
+            if self.has_image():
+                self._right_crop_start_view = self._clamp_view_pos_to_image(view_pos)
+                self._right_press_view_pos = view_pos
+                self._right_crop_started = False
+                self.viewport().setCursor(Qt.CrossCursor)
+            event.accept()
+            return
+
+        if event.button() == Qt.LeftButton and not self._crop_view_rect.isNull():
+            hit = self._crop_hit_test(view_pos)
+            if hit and hit != "inside":
+                self._left_crop_mode = hit
+                self._left_crop_start_rect = QRectF(self._crop_view_rect)
+                self._left_press_view_pos = view_pos
+                cursor = self._cursor_for_crop_hit(hit)
+                if cursor is not None:
+                    self.viewport().setCursor(cursor)
+                event.accept()
+                return
+            if hit == "inside":
+                self._left_crop_mode = "inside_pending_save"
+                self._left_crop_start_rect = QRectF(self._crop_view_rect)
+                self._left_press_view_pos = view_pos
+                self.viewport().setCursor(Qt.PointingHandCursor)
+                event.accept()
+                return
+
+        super().mousePressEvent(event)
+
     def mouseMoveEvent(self, event):
+        view_pos = event.position()
+
+        if self._right_crop_start_view is not None and (event.buttons() & Qt.RightButton):
+            if (not self._right_crop_started) and (not self._mouse_moved_far(self._right_press_view_pos, view_pos)):
+                event.accept()
+                return
+            self._right_crop_started = True
+            current = self._clamp_view_pos_to_image(view_pos)
+            self._set_crop_rect(QRectF(self._right_crop_start_view, current))
+            event.accept()
+            return
+
+        if self._left_crop_mode:
+            if self._left_crop_mode in {"top_left", "top", "top_right", "right", "bottom_right", "bottom", "bottom_left", "left"}:
+                self._set_crop_rect(self._adjust_crop_rect(self._left_crop_mode, view_pos))
+                event.accept()
+                return
+
+            if self._left_crop_mode == "inside_pending_save":
+                if self._mouse_moved_far(self._left_press_view_pos, view_pos):
+                    self._left_crop_mode = "inside_move"
+                    self._set_crop_rect(self._move_crop_rect_by_delta(
+                        self._left_crop_start_rect,
+                        view_pos - self._left_press_view_pos,
+                    ))
+                    self.viewport().setCursor(Qt.SizeAllCursor)
+                event.accept()
+                return
+
+            if self._left_crop_mode == "inside_move":
+                self._set_crop_rect(self._move_crop_rect_by_delta(
+                    self._left_crop_start_rect,
+                    view_pos - self._left_press_view_pos,
+                ))
+                event.accept()
+                return
+
         super().mouseMoveEvent(event)
+        if event.buttons() == Qt.NoButton:
+            self._update_crop_cursor(view_pos)
 
     def mouseReleaseEvent(self, event):
+        view_pos = event.position()
+
+        if event.button() == Qt.RightButton and self._right_crop_start_view is not None:
+            if self._right_crop_started:
+                self._set_crop_rect(QRectF(self._right_crop_start_view, self._clamp_view_pos_to_image(view_pos)))
+                if not self._crop_rect_is_usable(self._crop_view_rect):
+                    self._clear_crop_selection()
+                else:
+                    self._right_crop_start_view = None
+                    self._right_press_view_pos = None
+                    self._right_crop_started = False
+                    self._update_crop_cursor(view_pos)
+            else:
+                self._clear_crop_selection()
+            event.accept()
+            return
+
+        if event.button() == Qt.LeftButton and self._left_crop_mode:
+            mode = self._left_crop_mode
+            should_save = mode == "inside_pending_save" and not self._mouse_moved_far(self._left_press_view_pos, view_pos)
+            if mode in {"top_left", "top", "top_right", "right", "bottom_right", "bottom", "bottom_left", "left"}:
+                self._set_crop_rect(self._adjust_crop_rect(mode, view_pos))
+            self._left_crop_mode = ""
+            self._left_press_view_pos = None
+            self._left_crop_start_rect = QRectF()
+            if should_save:
+                self.crop_save_requested.emit()
+            self._update_crop_cursor(view_pos)
+            event.accept()
+            return
+
         super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton:
             self._schedule_fullres_upgrade(FULLRES_IDLE_DELAY_MS)
@@ -1472,6 +2005,9 @@ class ImageView(QGraphicsView):
 
         old_br = self._item.boundingRect()
         old_center = self.mapToScene(self.viewport().rect().center()) if keep_view and not old_br.isNull() else None
+        old_page = self._page_index
+        if index != old_page:
+            self._clear_crop_selection()
 
         # 直前ページの縮小キャッシュを退避
         if not self._item.boundingRect().isNull() and self._page_index in self._image_cache:
@@ -1762,6 +2298,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.view.state_changed.connect(self._update_ui)
         self.view.file_dropped.connect(self._open_dropped_file)
+        self.view.crop_save_requested.connect(self._save_current_crop)
         self._allow_close = False
         self._tray_enabled = bool(enable_tray)
         self._tray_available = False
@@ -1799,6 +2336,10 @@ class MainWindow(QMainWindow):
         self.act_quit = QAction("Exit", self)
         self.act_quit.triggered.connect(self._quit_from_tray)
 
+        self.crop_save_label = QLabel("保存先", self)
+        self.crop_save_edit = QLineEdit(_default_crop_save_text(), self)
+        self.crop_save_edit.setMinimumWidth(CROP_SAVE_TEXT_MIN_WIDTH)
+
         if self._tray_enabled:
             self._setup_tray_icon()
 
@@ -1811,11 +2352,13 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_next)
         tb.addAction(self.act_prev_file)
         tb.addAction(self.act_next_file)
+        tb.addWidget(self.crop_save_label)
+        tb.addWidget(self.crop_save_edit)
 
         self._dir_files = []
         self._dir_file_index = -1
 
-        self.statusBar().showMessage("Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan")
+        self.statusBar().showMessage("Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan / RightDrag=Crop")
         self._update_ui()
 
     def _apply_window_icon(self):
@@ -1934,7 +2477,7 @@ class MainWindow(QMainWindow):
                 msg += f"   (Error: {err})"
             self.statusBar().showMessage(msg)
         else:
-            self.statusBar().showMessage(f"Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan  Mode {mode_text}")
+            self.statusBar().showMessage(f"Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan / RightDrag=Crop  Mode {mode_text}")
 
     def open_file(self):
         if not self.isVisible():
@@ -1963,6 +2506,23 @@ class MainWindow(QMainWindow):
     def _open_dropped_file(self, path: str):
         log_info("MainWindow drop_open path=%s", path)
         self._open_path(path)
+
+    @Slot()
+    def _save_current_crop(self):
+        try:
+            target_path = _resolve_crop_save_path(self.view.file_path(), self.crop_save_edit.text())
+        except Exception as e:
+            msg = f"トリミング失敗: 保存先を解釈できません ({e})"
+            self.statusBar().showMessage(msg)
+            log_info("MainWindow crop_save resolve_failed err=%s", e)
+            return
+
+        ok, saved_path, msg = self.view.save_crop_to_file(str(target_path))
+        self.statusBar().showMessage(msg)
+        if ok:
+            log_info("MainWindow crop_save ok path=%s", saved_path)
+        else:
+            log_info("MainWindow crop_save failed path=%s msg=%s", saved_path, msg)
 
     def open_from_cli_args(self, args):
         if not args:

@@ -6,6 +6,13 @@ build/
 dist/
 release/
 
+# tests
+test/
+tests/
+pytest/
+pytests/
+resources/
+
 # PyInstaller spec files
 *.spec
 
@@ -13,14 +20,17 @@ release/
 __pycache__
 *.pyc
 
+# other
+*.ini
+*.csv
+*.log
+AGENTS.md
+
 # .NET build artifacts
 **/bin/
 **/obj/
-FastTiffViewerLauncher/pub_*/
 *.sln
+FastTiffViewerLauncher/pub_*/
 
 # (任意) デバッグシンボル
 *.pdb
-
-# その他
-AGENTS.md
