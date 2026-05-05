@@ -3,6 +3,7 @@ import os
 import logging
 import time
 import gc
+import struct
 from pathlib import Path
 from collections import OrderedDict
 
@@ -46,7 +47,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.2.4"
+WINDOW_TITLE = "Fast TIFF Viewer v1.3.0"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -73,6 +74,22 @@ CROP_EDGE_GRAB_WIDTH_PX = 10.0          # トリミング枠の辺をつかめ�
 CROP_DRAG_START_DISTANCE_PX = 3         # クリック保存とDnD操作を分ける移動距離(px)
 CROP_MIN_SIZE_PX = 2.0                  # トリミング保存を許可する最小サイズ(表示画像px)
 CROP_SAVE_TEXT_MIN_WIDTH = 340          # 保存先テキストボックスの最小幅(px)
+CROP_FULL_VIEWPORT_UPDATE = True        # トリミング枠表示中は全体再描画にしてパン時のちらつきを抑える
+
+TIFF_TAG_COMPRESSION = 259              # TIFF圧縮形式タグ
+TIFF_TAG_BITS_PER_SAMPLE = 258          # TIFF 1サンプルあたりのビット数タグ
+TIFF_COMPRESSION_TO_VIPS = {
+    1: "none",
+    4: "ccittfax4",
+    5: "lzw",
+    7: "jpeg",
+    8: "deflate",
+    32946: "deflate",
+    32773: "packbits",
+    34712: "jp2k",
+    50000: "zstd",
+    50001: "webp",
+}
 
 
 def _normalize_input_path(path_text: str) -> str:
@@ -344,6 +361,140 @@ def _resolve_crop_save_path(original_file_path: str, save_text: str, timestamp: 
         target = original.parent / target.name
 
     return _with_original_image_suffix(target, original_suffix)
+
+
+def _read_tiff_first_value(data: bytes, endian: str, field_type: int):
+    unpack_map = {
+        1: "B",    # BYTE
+        3: "H",    # SHORT
+        4: "I",    # LONG
+        6: "b",    # SBYTE
+        8: "h",    # SSHORT
+        9: "i",    # SLONG
+        16: "Q",   # LONG8
+        17: "q",   # SLONG8
+        18: "Q",   # IFD8
+    }
+    fmt = unpack_map.get(field_type)
+    if fmt is None or len(data) < struct.calcsize(fmt):
+        return None
+    return struct.unpack(endian + fmt, data[:struct.calcsize(fmt)])[0]
+
+
+def _read_tiff_ifd_tags(file_path: str, page_index: int, tag_ids: set):
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(16)
+            if len(header) < 8:
+                return {}
+
+            byte_order = header[:2]
+            if byte_order == b"II":
+                endian = "<"
+            elif byte_order == b"MM":
+                endian = ">"
+            else:
+                return {}
+
+            version = struct.unpack(endian + "H", header[2:4])[0]
+            if version == 42:
+                is_bigtiff = False
+                value_field_size = 4
+                ifd_offset = struct.unpack(endian + "I", header[4:8])[0]
+            elif version == 43 and len(header) >= 16:
+                is_bigtiff = True
+                value_field_size = 8
+                offset_size = struct.unpack(endian + "H", header[4:6])[0]
+                if offset_size != 8:
+                    return {}
+                ifd_offset = struct.unpack(endian + "Q", header[8:16])[0]
+            else:
+                return {}
+
+            page = 0
+            while ifd_offset:
+                f.seek(ifd_offset)
+                if is_bigtiff:
+                    raw_count = f.read(8)
+                    if len(raw_count) < 8:
+                        return {}
+                    entry_count = struct.unpack(endian + "Q", raw_count)[0]
+                    entry_size = 20
+                    count_fmt = "Q"
+                    next_fmt = "Q"
+                else:
+                    raw_count = f.read(2)
+                    if len(raw_count) < 2:
+                        return {}
+                    entry_count = struct.unpack(endian + "H", raw_count)[0]
+                    entry_size = 12
+                    count_fmt = "I"
+                    next_fmt = "I"
+
+                tags = {}
+                for _ in range(entry_count):
+                    entry = f.read(entry_size)
+                    if len(entry) < entry_size:
+                        return {}
+
+                    tag_id = struct.unpack(endian + "H", entry[0:2])[0]
+                    if tag_id not in tag_ids:
+                        continue
+
+                    field_type = struct.unpack(endian + "H", entry[2:4])[0]
+                    value_count = struct.unpack(endian + count_fmt, entry[4:4 + value_field_size])[0]
+                    value_or_offset = entry[4 + value_field_size:4 + value_field_size * 2]
+                    type_size = {
+                        1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8,
+                        11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8,
+                    }.get(field_type)
+                    if not type_size or value_count <= 0:
+                        continue
+
+                    byte_count = value_count * type_size
+                    if byte_count <= value_field_size:
+                        value_bytes = value_or_offset[:byte_count]
+                    else:
+                        value_offset = struct.unpack(endian + ("Q" if is_bigtiff else "I"), value_or_offset)[0]
+                        current = f.tell()
+                        f.seek(value_offset)
+                        value_bytes = f.read(type_size)
+                        f.seek(current)
+
+                    tags[tag_id] = _read_tiff_first_value(value_bytes, endian, field_type)
+
+                next_bytes = f.read(value_field_size)
+                if len(next_bytes) < value_field_size:
+                    return {}
+                next_ifd_offset = struct.unpack(endian + next_fmt, next_bytes)[0]
+
+                if page == page_index:
+                    return tags
+                page += 1
+                ifd_offset = next_ifd_offset
+    except OSError:
+        return {}
+    except (struct.error, OverflowError, ValueError):
+        return {}
+
+    return {}
+
+
+def _tiff_save_options_like_source(file_path: str, page_index: int) -> dict:
+    if Path(file_path).suffix.lower() not in {".tif", ".tiff"}:
+        return {}
+
+    tags = _read_tiff_ifd_tags(file_path, page_index, {TIFF_TAG_COMPRESSION, TIFF_TAG_BITS_PER_SAMPLE})
+    compression_tag = tags.get(TIFF_TAG_COMPRESSION)
+    compression = TIFF_COMPRESSION_TO_VIPS.get(compression_tag)
+    if not compression:
+        return {}
+
+    options = {"compression": compression}
+    # Group4圧縮は1bit画像として保存しないとlibtiffがエラーにする
+    if compression == "ccittfax4" and tags.get(TIFF_TAG_BITS_PER_SAMPLE) == 1:
+        options["bitdepth"] = 1
+    return options
 
 
 def _safe_process_cwd() -> Path:
@@ -1026,7 +1177,8 @@ class ImageView(QGraphicsView):
             crop_y1 = min(max(crop_y0 + 1, crop_y1), vips_img.height)
 
             cropped = vips_img.crop(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0)
-            cropped.write_to_file(str(target_path))
+            save_options = _tiff_save_options_like_source(self._file_path, self._page_index)
+            cropped.write_to_file(str(target_path), **save_options)
         except Exception as e:
             return False, str(target_path), f"トリミング失敗: {_vips_error_text(e)}"
 
@@ -1088,13 +1240,24 @@ class ImageView(QGraphicsView):
     def _crop_rect_is_usable(self, rect: QRectF) -> bool:
         return (not rect.isNull()) and rect.width() >= CROP_MIN_SIZE_PX and rect.height() >= CROP_MIN_SIZE_PX
 
+    def _sync_crop_viewport_update_mode(self):
+        if CROP_FULL_VIEWPORT_UPDATE and not self._crop_view_rect.isNull():
+            mode = QGraphicsView.FullViewportUpdate
+        else:
+            mode = QGraphicsView.SmartViewportUpdate
+
+        if self.viewportUpdateMode() != mode:
+            self.setViewportUpdateMode(mode)
+
     def _set_crop_rect(self, rect: QRectF):
         normalized = self._normalize_crop_rect(rect)
         if normalized.isNull():
             self._crop_view_rect = QRectF()
+            self._sync_crop_viewport_update_mode()
             self.viewport().update()
             return
         self._crop_view_rect = normalized
+        self._sync_crop_viewport_update_mode()
         self.viewport().update()
 
     def _clear_crop_selection(self):
@@ -1105,6 +1268,7 @@ class ImageView(QGraphicsView):
         self._left_crop_mode = ""
         self._left_press_view_pos = None
         self.viewport().unsetCursor()
+        self._sync_crop_viewport_update_mode()
         self.viewport().update()
 
     def _crop_view_rect_to_scene_rect(self, view_rect: QRectF) -> QRectF:
@@ -2336,7 +2500,7 @@ class MainWindow(QMainWindow):
         self.act_quit = QAction("Exit", self)
         self.act_quit.triggered.connect(self._quit_from_tray)
 
-        self.crop_save_label = QLabel("保存先", self)
+        self.crop_save_label = QLabel("　トリミング保存先 ： ", self)
         self.crop_save_edit = QLineEdit(_default_crop_save_text(), self)
         self.crop_save_edit.setMinimumWidth(CROP_SAVE_TEXT_MIN_WIDTH)
 
