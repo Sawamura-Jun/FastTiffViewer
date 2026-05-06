@@ -1179,15 +1179,23 @@ class ImageView(QGraphicsView):
             cropped = vips_img.crop(crop_x0, crop_y0, crop_x1 - crop_x0, crop_y1 - crop_y0)
             save_options = _tiff_save_options_like_source(self._file_path, self._page_index)
             cropped.write_to_file(str(target_path), **save_options)
+            extra_png_path = None
+            if save_options.get("compression") == "lzw":
+                extra_png_path = target_path.with_suffix(".png")
+                cropped.write_to_file(str(extra_png_path))
         except Exception as e:
             return False, str(target_path), f"トリミング失敗: {_vips_error_text(e)}"
+
+        saved_files_text = str(target_path)
+        if extra_png_path is not None:
+            saved_files_text += f" / {extra_png_path}"
 
         try:
             self._copy_vips_image_to_clipboard_png(cropped)
         except Exception as e:
-            return True, str(target_path), f"保存完了: {target_path}  クリップボードコピー失敗: {_vips_error_text(e)}"
+            return True, str(target_path), f"保存完了: {saved_files_text}  クリップボードコピー失敗: {_vips_error_text(e)}"
 
-        return True, str(target_path), f"保存完了: {target_path}  クリップボード: PNG"
+        return True, str(target_path), f"保存完了: {saved_files_text}  クリップボード: PNG"
 
     def _copy_vips_image_to_clipboard_png(self, vips_img: pyvips.Image):
         # クリップボードにはPNG MIMEとQt画像データの両方を載せ、貼り付け先の互換性を上げる
