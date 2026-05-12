@@ -47,7 +47,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.3.0"
+WINDOW_TITLE = "Fast TIFF Viewer v1.3.1"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -551,6 +551,27 @@ def _pin_process_cwd(reason: str) -> bool:
 def _vips_error_text(exc: Exception) -> str:
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def _set_png_clipboard_mime_data(mime: QMimeData, data: QByteArray):
+    # Office系アプリがWindowsクリップボード形式名"PNG"として取得できるよう設定する
+    if sys.platform == "win32":
+        mime.setData('application/x-qt-windows-mime;value="PNG"', data)
+
+
+def _is_black_and_white_tiff(file_path: str, page_index: int) -> bool:
+    if Path(file_path).suffix.lower() not in {".tif", ".tiff"}:
+        return False
+    tags = _read_tiff_ifd_tags(file_path, page_index, {TIFF_TAG_BITS_PER_SAMPLE})
+    return tags.get(TIFF_TAG_BITS_PER_SAMPLE) == 1
+
+
+def _png_clipboard_buffer(vips_img: pyvips.Image, is_black_and_white_tiff: bool):
+    if is_black_and_white_tiff:
+        # 1bit白黒PNGにする場合は下記を使う。現時点では他画像と同じ圧縮設定にする。
+        return vips_img.write_to_buffer(".png", compression=9, bitdepth=1)
+        # return vips_img.write_to_buffer(".png", compression=9)
+    return vips_img.write_to_buffer(".png", compression=9)
 
 
 def _drop_vips_caches():
@@ -1191,28 +1212,22 @@ class ImageView(QGraphicsView):
             saved_files_text += f" / {extra_png_path}"
 
         try:
-            self._copy_vips_image_to_clipboard_png(cropped)
+            self._copy_vips_image_to_clipboard_png(cropped, self._file_path, self._page_index)
         except Exception as e:
             return True, str(target_path), f"保存完了: {saved_files_text}  クリップボードコピー失敗: {_vips_error_text(e)}"
 
         return True, str(target_path), f"保存完了: {saved_files_text}  クリップボード: PNG"
 
-    def _copy_vips_image_to_clipboard_png(self, vips_img: pyvips.Image):
-        # クリップボードにはPNG MIMEとQt画像データの両方を載せ、貼り付け先の互換性を上げる
-        png_bytes = vips_img.write_to_buffer(".png")
+    def _copy_vips_image_to_clipboard_png(self, vips_img: pyvips.Image, source_file_path: str, page_index: int):
+        # 巨大画像でQImage展開のメモリ上限に触れないよう、PNGバイト列をWindows形式"PNG"で載せる
+        is_black_and_white = _is_black_and_white_tiff(source_file_path, page_index)
+        png_bytes = _png_clipboard_buffer(vips_img, is_black_and_white)
         data = QByteArray(bytes(png_bytes))
         mime = QMimeData()
-        mime.setData("image/png", data)
-        qimg = QImage.fromData(data, "PNG")
-        if not qimg.isNull():
-            mime.setImageData(qimg)
+        _set_png_clipboard_mime_data(mime, data)
         clipboard = QApplication.clipboard()
         if clipboard is None:
             raise RuntimeError("clipboard is unavailable")
-        # offscreen検証環境ではQMimeData所有権の終了処理で落ちるため、画像データ設定にフォールバックする
-        if QGuiApplication.platformName().lower() == "offscreen" and not qimg.isNull():
-            clipboard.setImage(qimg)
-            return
         clipboard.setMimeData(mime)
 
     def _image_bounds(self) -> QRectF:
