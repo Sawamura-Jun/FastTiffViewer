@@ -47,7 +47,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.3.1"
+WINDOW_TITLE = "Fast TIFF Viewer v1.3.2"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -574,9 +574,8 @@ def _is_black_and_white_tiff(file_path: str, page_index: int) -> bool:
 
 def _png_clipboard_buffer(vips_img: pyvips.Image, is_black_and_white_tiff: bool):
     if is_black_and_white_tiff:
-        # 1bit白黒PNGにする場合は下記を使う。現時点では他画像と同じ圧縮設定にする。
+        # 白黒TIFFは1bit PNGとして出力し、クリップボード転送時のサイズを抑える。
         return vips_img.write_to_buffer(".png", compression=9, bitdepth=1)
-        # return vips_img.write_to_buffer(".png", compression=9)
     return vips_img.write_to_buffer(".png", compression=9)
 
 
