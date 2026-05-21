@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QByteArray,
     QMimeData,
     QPointF,
+    QRect,
     QRectF,
     QSize,
     QStandardPaths,
@@ -47,7 +48,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.3.2"
+WINDOW_TITLE = "Fast TIFF Viewer v1.4.0"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -638,6 +639,67 @@ def _move_window_center_to_cursor(window):
     clamped_frame_y = max(min_frame_y, min(target_frame_y, max_frame_y))
 
     window.move(clamped_frame_x - frame_offset_x, clamped_frame_y - frame_offset_y)
+
+
+def _select_spread_layout_windows(windows, reference_window, screen_geometry: QRect):
+    # 見開き配置は、押下ウィンドウと同じモニター内に中心点がある表示中ウィンドウから選ぶ
+    ordered_windows = list(windows)
+    order_map = {id(w): i for i, w in enumerate(ordered_windows)}
+    candidates = []
+    for w in ordered_windows:
+        if w is None or (not w.isVisible()) or w.isMinimized():
+            continue
+        center = w.frameGeometry().center()
+        if screen_geometry.contains(center):
+            candidates.append(w)
+
+    if len(candidates) < 2:
+        return []
+    if len(candidates) == 2:
+        selected = candidates
+    else:
+        if reference_window not in candidates:
+            return []
+        reference_center = reference_window.frameGeometry().center()
+        others = [w for w in candidates if w is not reference_window]
+
+        def nearest_key(w):
+            center = w.frameGeometry().center()
+            dx = center.x() - reference_center.x()
+            dy = center.y() - reference_center.y()
+            return (dx * dx + dy * dy, abs(dx), order_map.get(id(w), len(order_map)))
+
+        selected = [reference_window, min(others, key=nearest_key)]
+
+    # 現在位置の左右関係を保って、左寄りのウィンドウを左配置にする
+    return sorted(
+        selected,
+        key=lambda w: (w.frameGeometry().center().x(), order_map.get(id(w), len(order_map))),
+    )
+
+
+def _client_geometry_for_target_frame(window, target_frame_rect: QRect) -> QRect:
+    frame = window.frameGeometry()
+    geometry = window.geometry()
+
+    left_margin = geometry.left() - frame.left()
+    top_margin = geometry.top() - frame.top()
+    right_margin = frame.right() - geometry.right()
+    bottom_margin = frame.bottom() - geometry.bottom()
+
+    # setGeometryはタイトルバーなどの外枠ではなくクライアント領域を指定するため、外枠ぶんを内側へ寄せる
+    width = max(1, target_frame_rect.width() - left_margin - right_margin)
+    height = max(1, target_frame_rect.height() - top_margin - bottom_margin)
+    return QRect(
+        target_frame_rect.left() + left_margin,
+        target_frame_rect.top() + top_margin,
+        width,
+        height,
+    )
+
+
+def _set_window_frame_geometry(window, target_frame_rect: QRect):
+    window.setGeometry(_client_geometry_for_target_frame(window, target_frame_rect))
 
 
 def _scale_to_fit(source_size: QSize, max_size: QSize) -> QSize:
@@ -2483,6 +2545,7 @@ class ImageView(QGraphicsView):
 class MainWindow(QMainWindow):
     IMAGE_EXTENSIONS = {".tif", ".tiff"}
     new_window_requested = Signal(str)
+    spread_layout_requested = Signal()
 
     def __init__(self, enable_tray: bool = True):
         super().__init__()
@@ -2507,6 +2570,10 @@ class MainWindow(QMainWindow):
         self.act_new_window = QAction("NewWindow", self)
         self.act_new_window.setShortcut("Ctrl+Shift+N")
         self.act_new_window.triggered.connect(self._request_new_window)
+
+        self.act_spread_layout = QAction("Spread(S)", self)
+        self.act_spread_layout.setShortcut(Qt.Key_S)
+        self.act_spread_layout.triggered.connect(self._request_spread_layout)
 
         self.act_open = QAction("Open", self)
         self.act_open.triggered.connect(self.open_file)
@@ -2534,7 +2601,7 @@ class MainWindow(QMainWindow):
         self.act_quit = QAction("Exit", self)
         self.act_quit.triggered.connect(self._quit_from_tray)
 
-        self.crop_save_label = QLabel("　トリミング保存先 ： ", self)
+        self.crop_save_label = QLabel("　Crop save as : ", self)
         self.crop_save_edit = QLineEdit(_default_crop_save_text(), self)
         self.crop_save_edit.setMinimumWidth(CROP_SAVE_TEXT_MIN_WIDTH)
 
@@ -2542,9 +2609,10 @@ class MainWindow(QMainWindow):
             self._setup_tray_icon()
 
         tb = self.addToolBar("Main")
-        # 指定順: Open, NewWindow, Fit, PageUp, PageDown, PrevFile, NextFile
+        # 指定順: Open, NewWindow, 見開き, Fit, PageUp, PageDown, PrevFile, NextFile
         tb.addAction(self.act_open)
         tb.addAction(self.act_new_window)
+        tb.addAction(self.act_spread_layout)
         tb.addAction(self.act_fit)
         tb.addAction(self.act_prev)
         tb.addAction(self.act_next)
@@ -2715,6 +2783,10 @@ class MainWindow(QMainWindow):
         self.new_window_requested.emit("")
         log_info("MainWindow requested new empty window")
 
+    def _request_spread_layout(self):
+        self.spread_layout_requested.emit()
+        log_info("MainWindow requested spread layout")
+
     @Slot(str)
     def _open_dropped_file(self, path: str):
         log_info("MainWindow drop_open path=%s", path)
@@ -2874,6 +2946,7 @@ class AppController(QObject):
         if not enable_tray:
             w.setAttribute(Qt.WA_DeleteOnClose, True)
         w.new_window_requested.connect(self.open_new_window)
+        w.spread_layout_requested.connect(lambda win=w: self.arrange_spread_layout(win))
         w.destroyed.connect(lambda _=None, win=w: self._on_window_destroyed(win))
         self._windows.append(w)
         log_info("AppController window created enable_tray=%s total=%s", enable_tray, len(self._windows))
@@ -2896,6 +2969,53 @@ class AppController(QObject):
         log_info("AppController open_new_window path=%s", normalized_path if normalized_path else "(none)")
         if normalized_path:
             QTimer.singleShot(0, lambda p=normalized_path, win=w: win.open_from_cli_args([p]))
+
+    def arrange_spread_layout(self, reference_window: MainWindow):
+        if reference_window is None:
+            return
+
+        reference_center = reference_window.frameGeometry().center()
+        screen = QGuiApplication.screenAt(reference_center)
+        if screen is None:
+            screen = reference_window.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            reference_window.statusBar().showMessage("見開き配置できません: モニターを取得できません")
+            log_info("AppController spread_layout failed no_screen")
+            return
+
+        selected = _select_spread_layout_windows(self._windows, reference_window, screen.geometry())
+        if len(selected) != 2:
+            reference_window.statusBar().showMessage("見開き配置には同じモニター上に2つのウィンドウが必要です")
+            log_info(
+                "AppController spread_layout skipped selected=%s screen=%s",
+                len(selected),
+                _rect_text(QRectF(screen.geometry())),
+            )
+            return
+
+        available = screen.availableGeometry()
+        left_width = available.width() // 2
+        right_width = available.width() - left_width
+        left_rect = QRect(available.x(), available.y(), left_width, available.height())
+        right_rect = QRect(available.x() + left_width, available.y(), right_width, available.height())
+
+        left_window, right_window = selected
+        for window, rect in ((left_window, left_rect), (right_window, right_rect)):
+            # 最大化などの状態を解除してから、対象モニターの半分へ配置する
+            window.showNormal()
+            _set_window_frame_geometry(window, rect)
+            QTimer.singleShot(0, window.view.fit_in_view)
+
+        reference_window.statusBar().showMessage("見開き配置しました")
+        log_info(
+            "AppController spread_layout arranged left=%s right=%s screen=%s available=%s",
+            id(left_window),
+            id(right_window),
+            _rect_text(QRectF(screen.geometry())),
+            _rect_text(QRectF(available)),
+        )
 
     def _on_ipc_message(self, message: str):
         if message.startswith("OPEN\t"):
