@@ -1071,6 +1071,7 @@ class ImageView(QGraphicsView):
     file_dropped = Signal(str)
     crop_save_requested = Signal()
     close_requested = Signal()
+    window_maximize_toggle_requested = Signal()
 
     def __init__(self, parent=None):
 
@@ -1906,6 +1907,15 @@ class ImageView(QGraphicsView):
 
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # 画像表示領域の左ダブルクリックでウィンドウ最大化を切り替える
+            self.window_maximize_toggle_requested.emit()
+            event.accept()
+            return
+
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
         view_pos = event.position()
 
@@ -2560,6 +2570,7 @@ class MainWindow(QMainWindow):
         self.view.file_dropped.connect(self._open_dropped_file)
         self.view.crop_save_requested.connect(self._save_current_crop)
         self.view.close_requested.connect(self._close_from_shortcut)
+        self.view.window_maximize_toggle_requested.connect(self._toggle_window_maximized)
         self._allow_close = False
         self._tray_enabled = bool(enable_tray)
         self._tray_available = False
@@ -2702,6 +2713,16 @@ class MainWindow(QMainWindow):
         # cキーはアクティブなウィンドウだけを通常の閉じる動作へ流す
         log_info("MainWindow close requested from keyboard shortcut")
         self.close()
+
+    def _toggle_window_maximized(self):
+        # 画像ビューからの操作だけで最大化/通常化を切り替える
+        if self.isMaximized():
+            self.showNormal()
+            log_info("MainWindow restored by image double click")
+            return
+
+        self.showMaximized()
+        log_info("MainWindow maximized by image double click")
 
     def _quit_application(self):
         app = QApplication.instance()
