@@ -48,7 +48,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.4.0"
+WINDOW_TITLE = "Fast TIFF Viewer v1.4.1"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
