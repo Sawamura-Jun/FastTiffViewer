@@ -48,7 +48,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.4.1"
+WINDOW_TITLE = "Fast TIFF Viewer v1.4.2"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -2863,12 +2863,16 @@ class MainWindow(QMainWindow):
     def _rebuild_directory_image_list(self, current_path: str):
         current = Path(current_path)
         try:
-            current_resolved = str(current.resolve(strict=False))
-            files = [
-                str(p.resolve(strict=False))
-                for p in current.parent.iterdir()
-                if p.is_file() and p.suffix.lower() in self.IMAGE_EXTENSIONS
-            ]
+            parent_path = os.path.abspath(os.fspath(current.parent))
+            current_resolved = os.path.abspath(os.fspath(current))
+            files = []
+            # ネットワークフォルダではPath.is_file/resolveの件数分アクセスが重いため、scandirの属性情報で一覧化する
+            with os.scandir(parent_path) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith((".tif", ".tiff")):
+                        continue
+                    if entry.is_file():
+                        files.append(os.path.join(parent_path, entry.name))
         except OSError:
             self._dir_files = []
             self._dir_file_index = -1
