@@ -4,6 +4,7 @@ import logging
 import time
 import gc
 import struct
+import shutil
 from pathlib import Path
 from collections import OrderedDict
 
@@ -48,7 +49,7 @@ LOGGER = logging.getLogger("fasttiffviewer")
 ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 上記 "0"を"1"でlogファイル出力
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.4.2"
+WINDOW_TITLE = "Fast TIFF Viewer v1.5.0"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
@@ -275,6 +276,58 @@ def _default_open_directory() -> str:
         if p.exists() and p.is_dir():
             return str(p)
     return str(Path.home())
+
+
+def _default_desktop_directory() -> Path:
+    candidates = []
+
+    qt_desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+    if qt_desktop:
+        candidates.append(Path(qt_desktop))
+
+    if os.name == "nt":
+        one_drive = os.environ.get("OneDrive")
+        user_profile = os.environ.get("USERPROFILE")
+        if one_drive:
+            candidates.append(Path(one_drive) / "Desktop")
+        if user_profile:
+            candidates.append(Path(user_profile) / "Desktop")
+
+    candidates.append(Path.home() / "Desktop")
+    candidates.append(Path.home())
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_dir():
+                return p
+        except OSError:
+            continue
+    return Path.home()
+
+
+def _desktop_copy_target_path(source_file_path: str) -> Path:
+    return _default_desktop_directory() / Path(source_file_path).name
+
+
+def _copy_file_to_desktop(source_file_path: str) -> Path:
+    source_path = Path(source_file_path)
+    if not source_path.is_file():
+        raise FileNotFoundError(str(source_path))
+
+    target_path = _desktop_copy_target_path(source_file_path)
+    if target_path.exists():
+        try:
+            if source_path.samefile(target_path):
+                return target_path
+        except OSError:
+            pass
+
+        if target_path.is_dir():
+            raise IsADirectoryError(str(target_path))
+
+    # 現在表示中の元ファイルをコピーするだけで、ビューの読み込み先は変更しない
+    shutil.copy2(source_path, target_path)
+    return target_path
 
 
 def _default_pictures_directory() -> Path:
@@ -2586,6 +2639,9 @@ class MainWindow(QMainWindow):
         self.act_spread_layout.setShortcut(Qt.Key_S)
         self.act_spread_layout.triggered.connect(self._request_spread_layout)
 
+        self.act_save = QAction("Save", self)
+        self.act_save.triggered.connect(self._save_current_file_to_desktop)
+
         self.act_open = QAction("Open", self)
         self.act_open.triggered.connect(self.open_file)
 
@@ -2620,7 +2676,8 @@ class MainWindow(QMainWindow):
             self._setup_tray_icon()
 
         tb = self.addToolBar("Main")
-        # 指定順: Open, NewWindow, 見開き, Fit, PageUp, PageDown, PrevFile, NextFile
+        # 指定順: Save, Open, NewWindow, 見開き, Fit, PageUp, PageDown, PrevFile, NextFile
+        tb.addAction(self.act_save)
         tb.addAction(self.act_open)
         tb.addAction(self.act_new_window)
         tb.addAction(self.act_spread_layout)
@@ -2765,6 +2822,7 @@ class MainWindow(QMainWindow):
         self.act_prev.setEnabled(has_file and pc > 1 and pi > 0)
         self.act_next.setEnabled(has_file and pc > 1 and (pc == 0 or pi < pc - 1))
         self.act_fit.setEnabled(self.view.has_image())
+        self.act_save.setEnabled(has_file)
         self.act_next_file.setEnabled(bool(self._neighbor_file_path(1)))
         self.act_prev_file.setEnabled(bool(self._neighbor_file_path(-1)))
 
@@ -2799,6 +2857,50 @@ class MainWindow(QMainWindow):
 
         log_info("MainWindow open_file selected path=%s", path)
         self._open_path(path)
+
+    def _save_current_file_to_desktop(self):
+        source_path = self.view.file_path()
+        if not source_path:
+            self.statusBar().showMessage("保存失敗: 開いているファイルがありません")
+            log_info("MainWindow desktop_save skipped no_file")
+            return
+
+        try:
+            target_path = _desktop_copy_target_path(source_path)
+        except Exception as e:
+            msg = f"保存失敗: 保存先を解釈できません ({e})"
+            self.statusBar().showMessage(msg)
+            log_info("MainWindow desktop_save resolve_failed source=%s err=%s", source_path, e)
+            return
+
+        if target_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "Save",
+                f"デスクトップに同じファイル名があります。\n上書き保存しますか？\n\n{target_path}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.statusBar().showMessage(f"保存キャンセル: {target_path}")
+                log_info("MainWindow desktop_save canceled source=%s target=%s", source_path, str(target_path))
+                return
+
+        try:
+            saved_path = _copy_file_to_desktop(source_path)
+        except Exception as e:
+            msg = f"保存失敗: {e}"
+            self.statusBar().showMessage(msg)
+            QMessageBox.warning(
+                self,
+                "Save failed",
+                f"デスクトップへの保存に失敗しました。\n\n元ファイル:\n{source_path}\n\n保存先:\n{target_path}\n\n{e}",
+            )
+            log_info("MainWindow desktop_save failed source=%s target=%s err=%s", source_path, str(target_path), e)
+            return
+
+        self.statusBar().showMessage(f"保存完了: {saved_path}")
+        log_info("MainWindow desktop_save ok source=%s target=%s", source_path, str(saved_path))
 
     def _request_new_window(self):
         self.new_window_requested.emit("")
