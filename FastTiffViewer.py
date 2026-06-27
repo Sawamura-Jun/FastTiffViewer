@@ -3419,6 +3419,31 @@ class AppController(QObject):
         if normalized_path:
             QTimer.singleShot(0, lambda p=normalized_path, win=w: win.open_from_cli_args([p]))
 
+    def _bring_spread_windows_to_front(self, reference_window: MainWindow):
+        # 操作元を最後に前面化し、2画面を連続した最前面のZオーダーへ移動する
+        windows = [window for window in self._spread_windows if window is not reference_window]
+        if reference_window in self._spread_windows:
+            windows.append(reference_window)
+
+        raised_count = 0
+        for window in windows:
+            try:
+                if window.isMinimized():
+                    window.showNormal()
+                else:
+                    window.show()
+                window.raise_()
+                raised_count += 1
+            except RuntimeError:
+                continue
+
+        if reference_window in windows:
+            try:
+                reference_window.activateWindow()
+            except RuntimeError:
+                pass
+        log_info("AppController spread_windows brought_to_front count=%s", raised_count)
+
     def arrange_spread_layout(self, reference_window: MainWindow):
         if reference_window is None:
             return
@@ -3431,6 +3456,7 @@ class AppController(QObject):
                 window.statusBar().showMessage(message)
             if enable_sync:
                 QTimer.singleShot(0, lambda win=reference_window: self._synchronize_view_from(win))
+            self._bring_spread_windows_to_front(reference_window)
             log_info("AppController spread_sync toggled enabled=%s", enable_sync)
             return
 
@@ -3476,6 +3502,7 @@ class AppController(QObject):
 
         for window in self._spread_windows:
             window.statusBar().showMessage("見開き配置・同期を有効にしました")
+        self._bring_spread_windows_to_front(reference_window)
         log_info(
             "AppController spread_layout arranged left=%s right=%s screen=%s available=%s",
             id(left_window),
