@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QStyle,
     QSystemTrayIcon,
 )
@@ -97,6 +98,7 @@ DIFF_TIFF_COMPRESSION = "lzw"           # 差分TIFFの圧縮形式
 DIFF_FILE_REPLACE_MAX_ATTEMPTS = 8       # 共有違反時のファイル置換試行回数
 DIFF_FILE_RETRY_BASE_DELAY_MS = 50       # ファイル置換再試行の初期待機時間(ms)
 DIFF_FILE_RETRY_MAX_DELAY_MS = 500       # ファイル置換再試行の最大待機時間(ms)
+DIFF_PROGRESS_BAR_WIDTH_PX = 220         # ステータスバー上の差分進捗バー幅(px)
 
 TIFF_TAG_COMPRESSION = 259              # TIFF圧縮形式タグ
 TIFF_TAG_BITS_PER_SAMPLE = 258          # TIFF 1サンプルあたりのビット数タグ
@@ -594,7 +596,17 @@ def _diff_file_retry_delay_seconds(attempt: int) -> float:
     return delay_ms / 1000.0
 
 
-def _replace_diff_file_with_retry(temp_path: Path, target_path: Path):
+def _report_diff_progress(progress_callback, percent: int, stage: str):
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(max(0, min(100, int(percent))), str(stage))
+    except Exception:
+        # 進捗表示側の終了などが差分ファイル生成を失敗させないようにする
+        log_exception("Diff progress callback failed percent=%s stage=%s", percent, stage)
+
+
+def _replace_diff_file_with_retry(temp_path: Path, target_path: Path, progress_callback=None):
     for attempt in range(1, DIFF_FILE_REPLACE_MAX_ATTEMPTS + 1):
         try:
             os.replace(str(temp_path), str(target_path))
@@ -630,17 +642,29 @@ def _replace_diff_file_with_retry(temp_path: Path, target_path: Path):
                 str(temp_path),
                 str(target_path),
             )
+            _report_diff_progress(
+                progress_callback,
+                96,
+                f"保存ファイルを使用中のため再試行しています ({attempt}/{DIFF_FILE_REPLACE_MAX_ATTEMPTS})",
+            )
             # libvipsが書き込み直後のファイルを保持する場合に備えてキャッシュと参照を解放する
             _drop_vips_caches()
             gc.collect()
             time.sleep(delay_seconds)
 
 
-def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) -> Path:
+def _create_diff_tiff(
+    old_file_path: str,
+    new_file_path: str,
+    output_path: str,
+    progress_callback=None,
+) -> Path:
     """新旧TIFFの全ページ差分をLZW圧縮のマルチページTIFFへ保存する。"""
+    _report_diff_progress(progress_callback, 0, "差分画像を準備しています")
     old_count = _vips_tiff_page_count(old_file_path)
     new_count = _vips_tiff_page_count(new_file_path)
     page_count = max(old_count, new_count)
+    _report_diff_progress(progress_callback, 5, f"ページ情報を確認しました ({page_count}ページ)")
     log_info(
         "Diff TIFF source probed old=%s old_pages=%s new=%s new_pages=%s output=%s",
         old_file_path,
@@ -681,9 +705,15 @@ def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) 
             canvas_height = max(canvas_height, new_page.height)
         old_pages.append(old_page)
         new_pages.append(new_page)
+        prepared_percent = 5 + int(15 * (page_index + 1) / page_count)
+        _report_diff_progress(
+            progress_callback,
+            prepared_percent,
+            f"ページを準備しています ({page_index + 1}/{page_count})",
+        )
 
     diff_pages = []
-    for old_page, new_page in zip(old_pages, new_pages):
+    for page_index, (old_page, new_page) in enumerate(zip(old_pages, new_pages)):
         if old_page is None:
             old_page = _white_diff_vips_image(canvas_width, canvas_height)
         else:
@@ -693,6 +723,12 @@ def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) 
         else:
             new_page = _embed_diff_page(new_page, canvas_width, canvas_height)
         diff_pages.append(_make_diff_vips_page(old_page, new_page))
+        diff_percent = 20 + int(10 * (page_index + 1) / page_count)
+        _report_diff_progress(
+            progress_callback,
+            diff_percent,
+            f"差分を作成しています ({page_index + 1}/{page_count})",
+        )
 
     # libvipsのマルチページ形式は同じ高さのページを縦結合し、page-heightを設定する
     joined = pyvips.Image.arrayjoin(diff_pages, across=1)
@@ -714,7 +750,16 @@ def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) 
         DIFF_TIFF_COMPRESSION,
     )
     try:
+        # libvipsの評価進捗をTIFF書き込み区間の30～95%へ割り当てる
+        def on_vips_eval(_image, progress):
+            write_percent = 30 + int(max(0, min(100, int(progress.percent))) * 0.65)
+            _report_diff_progress(progress_callback, write_percent, "差分TIFFを書き込んでいます")
+
+        joined.set_progress(True)
+        joined.signal_connect("eval", on_vips_eval)
+        _report_diff_progress(progress_callback, 30, "差分TIFFを書き込んでいます")
         joined.write_to_file(str(temp_path), compression=DIFF_TIFF_COMPRESSION)
+        _report_diff_progress(progress_callback, 95, "差分TIFFの書き込みが完了しました")
         temp_size = temp_path.stat().st_size if temp_path.exists() else -1
         log_info("Diff TIFF temp written temp=%s size_bytes=%s", str(temp_path), temp_size)
 
@@ -734,7 +779,8 @@ def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) 
             str(target_path),
             target_path.exists(),
         )
-        _replace_diff_file_with_retry(temp_path, target_path)
+        _report_diff_progress(progress_callback, 96, "保存ファイルを確定しています")
+        _replace_diff_file_with_retry(temp_path, target_path, progress_callback)
         log_info("Diff TIFF replace finished target=%s", str(target_path))
     finally:
         try:
@@ -743,6 +789,7 @@ def _create_diff_tiff(old_file_path: str, new_file_path: str, output_path: str) 
                 log_info("Diff TIFF temp removed temp=%s", str(temp_path))
         except OSError:
             log_exception("Diff TIFF temp cleanup failed temp=%s", str(temp_path))
+    _report_diff_progress(progress_callback, 100, "差分ファイルを保存しました")
     return target_path
 
 
@@ -1481,6 +1528,7 @@ class FullResPageTask(QRunnable):
 
 
 class DiffTiffSignals(QObject):
+    progress = Signal(int, str)          # (進捗率, 処理内容)
     finished = Signal(bool, str, str)  # (成功, 保存先, エラー)
 
 
@@ -1491,6 +1539,18 @@ class DiffTiffTask(QRunnable):
         self.new_file_path = new_file_path
         self.output_path = output_path
         self.signals = DiffTiffSignals()
+        self._last_progress = -1
+        self._last_progress_stage = ""
+
+    def _emit_progress(self, percent: int, stage: str):
+        percent = max(self._last_progress, max(0, min(100, int(percent))))
+        stage = str(stage)
+        # libvipsのeval通知は高頻度なため、同一内容のSignalは送らない
+        if percent == self._last_progress and stage == self._last_progress_stage:
+            return
+        self._last_progress = percent
+        self._last_progress_stage = stage
+        self.signals.progress.emit(percent, stage)
 
     def run(self):
         started = time.perf_counter()
@@ -1505,6 +1565,7 @@ class DiffTiffTask(QRunnable):
                 self.old_file_path,
                 self.new_file_path,
                 self.output_path,
+                self._emit_progress,
             )
         except Exception as e:
             error = _vips_error_text(e)
@@ -3198,6 +3259,8 @@ class MainWindow(QMainWindow):
         self._diff_pool = QThreadPool(self)
         self._diff_pool.setMaxThreadCount(1)
         self._diff_task = None
+        self._diff_progress_percent = 0
+        self._diff_progress_stage = ""
 
         self.act_new_window = QAction("NewWindow", self)
         self.act_new_window.setShortcut("Ctrl+Shift+N")
@@ -3244,6 +3307,14 @@ class MainWindow(QMainWindow):
         self.crop_save_label = QLabel("　Crop save as : ", self)
         self.crop_save_edit = QLineEdit(_default_crop_save_text(), self)
         self.crop_save_edit.setMinimumWidth(CROP_SAVE_TEXT_MIN_WIDTH)
+
+        self.diff_progress_bar = QProgressBar(self)
+        self.diff_progress_bar.setRange(0, 100)
+        self.diff_progress_bar.setFixedWidth(DIFF_PROGRESS_BAR_WIDTH_PX)
+        self.diff_progress_bar.setFormat("%p%")
+        self.diff_progress_bar.setTextVisible(True)
+        self.diff_progress_bar.hide()
+        self.statusBar().addPermanentWidget(self.diff_progress_bar)
 
         if self._tray_enabled:
             self._setup_tray_icon()
@@ -3465,7 +3536,11 @@ class MainWindow(QMainWindow):
         self.act_next_file.setEnabled(self._can_file_step(1) or partner_can_next_file)
         self.act_prev_file.setEnabled(self._can_file_step(-1) or partner_can_prev_file)
 
-        if has_file:
+        if self._diff_task is not None:
+            self.statusBar().showMessage(
+                f"差分検出中 ({self._diff_progress_percent}%): {self._diff_progress_stage}"
+            )
+        elif has_file:
             name = Path(self.view.file_path()).name
             pixel_size = self.view.current_pixel_size_text()
             if pc > 0:
@@ -3584,8 +3659,13 @@ class MainWindow(QMainWindow):
             target_path.exists(),
         )
         task = DiffTiffTask(old_file_path, new_file_path, str(target_path))
+        task.signals.progress.connect(self._on_diff_progress)
         task.signals.finished.connect(self._on_diff_finished)
         self._diff_task = task
+        self._diff_progress_percent = 0
+        self._diff_progress_stage = "差分画像を準備しています"
+        self.diff_progress_bar.setValue(0)
+        self.diff_progress_bar.show()
         self.act_diff.setEnabled(False)
         self.statusBar().showMessage(
             f"差分検出中: 旧={Path(old_file_path).name} / 新={Path(new_file_path).name}"
@@ -3593,9 +3673,23 @@ class MainWindow(QMainWindow):
         self._diff_pool.start(task)
         return True
 
+    @Slot(int, str)
+    def _on_diff_progress(self, percent: int, stage: str):
+        if self._diff_task is None:
+            return
+        self._diff_progress_percent = max(0, min(100, int(percent)))
+        self._diff_progress_stage = str(stage)
+        self.diff_progress_bar.setValue(self._diff_progress_percent)
+        self.statusBar().showMessage(
+            f"差分検出中 ({self._diff_progress_percent}%): {self._diff_progress_stage}"
+        )
+
     @Slot(bool, str, str)
     def _on_diff_finished(self, ok: bool, saved_path: str, error: str):
         self._diff_task = None
+        self.diff_progress_bar.hide()
+        self._diff_progress_percent = 0
+        self._diff_progress_stage = ""
         self._update_ui()
         if not ok:
             self.statusBar().showMessage(f"差分検出失敗: {error}")
