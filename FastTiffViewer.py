@@ -56,13 +56,13 @@ def _default_log_file_path() -> Path:
 
 LOG_FILE_PATH = _default_log_file_path()
 LOGGER = logging.getLogger("fasttiffviewer")
-ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "1").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_DEBUG_LOGGING = os.getenv("TIFFVIEWER_DEBUG_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
 LOG_LEVEL = logging.DEBUG if os.getenv("TIFFVIEWER_LOG_LEVEL", "INFO").strip().upper() == "DEBUG" else logging.INFO
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024    # ログファイル1世代の最大サイズ
 LOG_FILE_BACKUP_COUNT = 2               # 保持するバックアップログの世代数
-# TIFFVIEWER_DEBUG_LOG=0でログ停止、TIFFVIEWER_LOG_LEVEL=DEBUGで詳細ログを出力
+# 通常はログを停止し、必要な場合だけTIFFVIEWER_DEBUG_LOG=1で有効化する
 
-WINDOW_TITLE = "Fast TIFF Viewer v1.6.1"
+WINDOW_TITLE = "Fast TIFF Viewer v1.7.0"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
