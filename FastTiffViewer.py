@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
 )
 import pyvips
+from PIL import Image as PILImage
 
 
 def _default_log_file_path() -> Path:
@@ -580,6 +581,64 @@ def _make_diff_vips_page(old_image: pyvips.Image, new_image: pyvips.Image) -> py
     return result.cast("uchar").copy(interpretation="srgb")
 
 
+def _write_diff_pages_tiff(diff_pages, temp_path: Path, progress_callback=None):
+    """ページ固有サイズを保った差分TIFFを一時ファイルへ書き込む。"""
+    page_count = len(diff_pages)
+    first_page = diff_pages[0]
+    has_variable_sizes = any(
+        page.width != first_page.width or page.height != first_page.height
+        for page in diff_pages[1:]
+    )
+
+    if not has_variable_sizes:
+        # 同一サイズならlibvipsのストリーミング書き込みを維持する
+        joined = pyvips.Image.arrayjoin(diff_pages, across=1)
+        joined.set_type(pyvips.GValue.gint_type, "page-height", first_page.height)
+
+        def on_vips_eval(_image, progress):
+            write_percent = 30 + int(max(0, min(100, int(progress.percent))) * 0.65)
+            _report_diff_progress(progress_callback, write_percent, "差分TIFFを書き込んでいます")
+
+        joined.set_progress(True)
+        joined.signal_connect("eval", on_vips_eval)
+        _report_diff_progress(progress_callback, 30, "差分TIFFを書き込んでいます")
+        joined.write_to_file(str(temp_path), compression=DIFF_TIFF_COMPRESSION)
+        _report_diff_progress(progress_callback, 95, "差分TIFFの書き込みが完了しました")
+        return
+
+    # libvipsの複数ページ保存は全ページを同じ寸法に揃えるため、ページごとに
+    # 一度保存し、Pillowで可変サイズのマルチページTIFFへまとめる
+    page_dir = temp_path.with_name(f"{temp_path.name}.pages")
+    page_dir.mkdir()
+    page_paths = []
+    pil_pages = []
+    try:
+        _report_diff_progress(progress_callback, 30, "差分TIFFを書き込んでいます")
+        for page_index, page in enumerate(diff_pages):
+            page_path = page_dir / f"{page_index:06d}.tif"
+            page.write_to_file(str(page_path), compression=DIFF_TIFF_COMPRESSION)
+            page_paths.append(page_path)
+            page_percent = 30 + int(45 * (page_index + 1) / page_count)
+            _report_diff_progress(progress_callback, page_percent, "差分TIFFを書き込んでいます")
+
+        for page_path in page_paths:
+            pil_pages.append(PILImage.open(page_path))
+        pil_pages[0].save(
+            str(temp_path),
+            save_all=True,
+            append_images=pil_pages[1:],
+            compression="tiff_lzw",
+        )
+        _report_diff_progress(progress_callback, 95, "差分TIFFの書き込みが完了しました")
+    finally:
+        for page in pil_pages:
+            page.close()
+        try:
+            shutil.rmtree(page_dir)
+        except OSError:
+            log_exception("Diff TIFF page temp cleanup failed temp=%s", str(page_dir))
+
+
 def _is_file_sharing_violation(error: OSError) -> bool:
     # Windowsの共有違反はPython上でwinerror=32、errno=13として通知される
     winerror = getattr(error, "winerror", None)
@@ -676,8 +735,6 @@ def _create_diff_tiff(
 
     old_pages = []
     new_pages = []
-    canvas_width = 1
-    canvas_height = 1
     for page_index in range(page_count):
         old_page = None
         new_page = None
@@ -690,8 +747,6 @@ def _create_diff_tiff(
                 page=page_index,
                 n=1,
             ))
-            canvas_width = max(canvas_width, old_page.width)
-            canvas_height = max(canvas_height, old_page.height)
         if page_index < new_count:
             new_page = _normalize_diff_vips_image(pyvips.Image.new_from_file(
                 new_file_path,
@@ -701,8 +756,6 @@ def _create_diff_tiff(
                 page=page_index,
                 n=1,
             ))
-            canvas_width = max(canvas_width, new_page.width)
-            canvas_height = max(canvas_height, new_page.height)
         old_pages.append(old_page)
         new_pages.append(new_page)
         prepared_percent = 5 + int(15 * (page_index + 1) / page_count)
@@ -714,6 +767,17 @@ def _create_diff_tiff(
 
     diff_pages = []
     for page_index, (old_page, new_page) in enumerate(zip(old_pages, new_pages)):
+        # 比較対象のページ内だけでキャンバスを決め、他ページの寸法に影響させない
+        canvas_width = max(
+            1,
+            old_page.width if old_page is not None else 0,
+            new_page.width if new_page is not None else 0,
+        )
+        canvas_height = max(
+            1,
+            old_page.height if old_page is not None else 0,
+            new_page.height if new_page is not None else 0,
+        )
         if old_page is None:
             old_page = _white_diff_vips_image(canvas_width, canvas_height)
         else:
@@ -730,41 +794,31 @@ def _create_diff_tiff(
             f"差分を作成しています ({page_index + 1}/{page_count})",
         )
 
-    # libvipsのマルチページ形式は同じ高さのページを縦結合し、page-heightを設定する
-    joined = pyvips.Image.arrayjoin(diff_pages, across=1)
-    joined.set_type(pyvips.GValue.gint_type, "page-height", canvas_height)
-
     target_path = Path(output_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = target_path.with_name(
         f".{target_path.stem}.{os.getpid()}.{time.time_ns()}.tmp{target_path.suffix}"
     )
+    page_widths = [page.width for page in diff_pages]
+    page_heights = [page.height for page in diff_pages]
     log_info(
-        "Diff TIFF save prepared target=%s target_exists=%s temp=%s pages=%s canvas=%sx%s compression=%s",
+        "Diff TIFF save prepared target=%s target_exists=%s temp=%s pages=%s page_size_range=%sx%s..%sx%s compression=%s",
         str(target_path),
         target_path.exists(),
         str(temp_path),
         page_count,
-        canvas_width,
-        canvas_height,
+        min(page_widths),
+        min(page_heights),
+        max(page_widths),
+        max(page_heights),
         DIFF_TIFF_COMPRESSION,
     )
     try:
-        # libvipsの評価進捗をTIFF書き込み区間の30～95%へ割り当てる
-        def on_vips_eval(_image, progress):
-            write_percent = 30 + int(max(0, min(100, int(progress.percent))) * 0.65)
-            _report_diff_progress(progress_callback, write_percent, "差分TIFFを書き込んでいます")
-
-        joined.set_progress(True)
-        joined.signal_connect("eval", on_vips_eval)
-        _report_diff_progress(progress_callback, 30, "差分TIFFを書き込んでいます")
-        joined.write_to_file(str(temp_path), compression=DIFF_TIFF_COMPRESSION)
-        _report_diff_progress(progress_callback, 95, "差分TIFFの書き込みが完了しました")
+        _write_diff_pages_tiff(diff_pages, temp_path, progress_callback)
         temp_size = temp_path.stat().st_size if temp_path.exists() else -1
         log_info("Diff TIFF temp written temp=%s size_bytes=%s", str(temp_path), temp_size)
 
         # 書き込みグラフを破棄してから置換し、一時TIFFのファイルハンドルを解放する
-        joined = None
         diff_pages.clear()
         old_pages.clear()
         new_pages.clear()
