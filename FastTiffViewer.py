@@ -70,7 +70,8 @@ WINDOW_TITLE = "Fast TIFF Viewer v1.7.2"
 INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 
 # 表示/デコード挙動の調整パラメータ
-DEFAULT_WINDOW_SIZE = (1060, 800)       # アプリ起動時の初期ウィンドウサイズ(px)
+DEFAULT_IMAGE_VIEW_SIZE = (1000, 705)   # 画像引数なしで起動したときの画像表示領域サイズ(px)
+STARTUP_IMAGE_VIEW_LONG_EDGE_PX = 1000  # 画像引数ありで起動したときの画像表示領域の長辺(px)
 MIN_WINDOW_SIZE = (495, 400)            # ウィンドウの最小許容サイズ(px)
 CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12     # Ctrl+ホイール1段あたりのウィンドウ拡縮倍率
 FULLRES_IDLE_DELAY_MS = 280             # 通常操作後にfullresデコード要求を出すまでの待機時間(ms)
@@ -261,6 +262,56 @@ def _size_text(size: QSize) -> str:
     if size is None or not size.isValid():
         return "invalid"
     return f"{size.width()}x{size.height()}"
+
+
+def _image_view_size_for_source(source_size: QSize, long_edge_px: int = STARTUP_IMAGE_VIEW_LONG_EDGE_PX) -> QSize:
+    """画像の縦横比を保ち、長辺が指定サイズになる画像表示領域を返す。"""
+    if source_size is None or not source_size.isValid() or long_edge_px <= 0:
+        return QSize()
+
+    source_width = source_size.width()
+    source_height = source_size.height()
+    if source_width >= source_height:
+        target_width = long_edge_px
+        target_height = max(1, int(round(source_height * long_edge_px / source_width)))
+    else:
+        target_width = max(1, int(round(source_width * long_edge_px / source_height)))
+        target_height = long_edge_px
+    return QSize(target_width, target_height)
+
+
+def _startup_image_view_size(file_path: str = "") -> QSize:
+    """起動引数の画像に合わせた初期画像表示領域サイズを返す。"""
+    if not file_path:
+        return QSize(DEFAULT_IMAGE_VIEW_SIZE[0], DEFAULT_IMAGE_VIEW_SIZE[1])
+
+    try:
+        # 全画素は展開せず、先頭ページのヘッダー情報だけで縦横比を取得する
+        probe = pyvips.Image.new_from_file(
+            file_path,
+            access="sequential",
+            sequential=True,
+            autorotate=True,
+            page=0,
+            n=1,
+        )
+        source_size = QSize(int(probe.width), int(probe.height))
+        target_size = _image_view_size_for_source(source_size)
+        if target_size.isValid():
+            log_info(
+                "startup image_view_size file=%s source=%s target=%s",
+                file_path,
+                _size_text(source_size),
+                _size_text(target_size),
+            )
+            return target_size
+    except Exception as e:
+        # 読み込みエラーの表示は従来の画像読み込み処理に任せ、起動自体は継続する
+        log_info("startup image_size_probe failed file=%s err=%s", file_path, e)
+
+    fallback = QSize(DEFAULT_IMAGE_VIEW_SIZE[0], DEFAULT_IMAGE_VIEW_SIZE[1])
+    log_info("startup image_view_size fallback file=%s target=%s", file_path, _size_text(fallback))
+    return fallback
 
 
 def _img_text(img: QImage) -> str:
@@ -3402,7 +3453,7 @@ class MainWindow(QMainWindow):
         self._diff_progress_percent = 0
         self._diff_progress_stage = ""
 
-        self.act_new_window = QAction("NewWindow", self)
+        self.act_new_window = QAction("New", self)
         self.act_new_window.setShortcut("Ctrl+Shift+N")
         self.act_new_window.triggered.connect(self._request_new_window)
 
@@ -3479,6 +3530,36 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Open / PgUp/PgDn=Prev/Next / Wheel=Zoom / Drag=Pan / RightDrag=Crop / C=Close")
         self._update_ui()
+
+    def resize_for_image_view_size(self, target_size: QSize):
+        """画面表示前に、画像表示領域が指定サイズになるようウィンドウを調整する。"""
+        if target_size is None or not target_size.isValid():
+            target_size = QSize(DEFAULT_IMAGE_VIEW_SIZE[0], DEFAULT_IMAGE_VIEW_SIZE[1])
+
+        # 非表示中にツールバー等の寸法を確定し、表示後の二段階リサイズを避ける
+        self.resize(target_size.width(), target_size.height())
+        self.ensurePolished()
+        main_layout = self.layout()
+        if main_layout is not None:
+            main_layout.activate()
+
+        chrome_width = max(0, self.width() - self.view.width())
+        chrome_height = max(0, self.height() - self.view.height())
+        view_frame = max(0, int(self.view.frameWidth()) * 2)
+        window_width = target_size.width() + chrome_width + view_frame
+        window_height = target_size.height() + chrome_height + view_frame
+        self.resize(window_width, window_height)
+        if main_layout is not None:
+            main_layout.activate()
+        log_info(
+            "MainWindow initial image_view target=%s window=%sx%s chrome=%sx%s frame=%s",
+            _size_text(target_size),
+            self.width(),
+            self.height(),
+            chrome_width,
+            chrome_height,
+            view_frame,
+        )
 
     def _apply_window_icon(self):
         icon_path = _find_app_icon_path()
@@ -3989,7 +4070,8 @@ class AppController(QObject):
 
     def startup(self, cli_args):
         self._primary_window = self._create_window(enable_tray=True)
-        self._primary_window.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
+        startup_path = _normalize_input_path(cli_args[0]) if cli_args else ""
+        self._primary_window.resize_for_image_view_size(_startup_image_view_size(startup_path))
         if cli_args:
             _move_window_center_to_cursor(self._primary_window)
             self._primary_window.show()
@@ -4166,7 +4248,7 @@ class AppController(QObject):
     def open_new_window(self, path: str = ""):
         normalized_path = _normalize_input_path(path) if path else ""
         w = self._create_window(enable_tray=False)
-        w.resize(DEFAULT_WINDOW_SIZE[0], DEFAULT_WINDOW_SIZE[1])
+        w.resize_for_image_view_size(_startup_image_view_size(normalized_path))
         _move_window_center_to_cursor(w)
         w.show()
         log_info("AppController open_new_window path=%s", normalized_path if normalized_path else "(none)")
