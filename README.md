@@ -1,5 +1,8 @@
 <img width="1174" height="950" alt="snapshot_20260214_201846_bc" src="https://github.com/user-attachments/assets/082b2fa5-67b1-4012-b215-2c2729502b7b" />
-<img width="1174" height="950" alt="snapshot_20260214_201911_bc" src="https://github.com/user-attachments/assets/0dd69755-c8fb-4178-9a94-fe52ca2ac5e2" />
+<img width="602" height="496" alt="スクリーンショット 2026-07-12 105837" src="https://github.com/user-attachments/assets/05ebb83c-d02a-442e-8fbb-2f12822598e9" />
+<img width="677" height="545" alt="スクリーンショット 2026-07-12 105401" src="https://github.com/user-attachments/assets/8e32601d-326c-41e9-bbaa-236f8a1db39c" />
+<img width="1124" height="713" alt="スクリーンショット 2026-07-12 105302" src="https://github.com/user-attachments/assets/e38f1835-2c57-473e-9898-ade198719153" />
+
 
 # TIFF 高速ビューワー / Fast TIFF Viewer
 
