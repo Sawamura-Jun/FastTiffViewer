@@ -73,6 +73,7 @@ INSTANCE_SERVER_NAME = "FastTiffViewer.Singleton.Main"
 # 表示/デコード挙動の調整パラメータ
 DEFAULT_IMAGE_VIEW_SIZE = (1000, 707)   # 画像引数なしで起動したときの画像表示領域サイズ(px)
 STARTUP_IMAGE_VIEW_LONG_EDGE_PX = 1000  # 画像引数ありで起動したときの画像表示領域の長辺(px)
+STARTUP_PORTRAIT_IMAGE_VIEW_HEIGHT_PX = 900  # 縦長画像を引数にして起動したときの画像表示領域の高さ(px)
 MIN_WINDOW_SIZE = (495, 400)            # ウィンドウの最小許容サイズ(px)
 CTRL_WHEEL_WINDOW_SCALE_BASE = 1.12     # Ctrl+ホイール1段あたりのウィンドウ拡縮倍率
 FULLRES_IDLE_DELAY_MS = 280             # 通常操作後にfullresデコード要求を出すまでの待機時間(ms)
@@ -265,19 +266,30 @@ def _size_text(size: QSize) -> str:
     return f"{size.width()}x{size.height()}"
 
 
-def _image_view_size_for_source(source_size: QSize, long_edge_px: int = STARTUP_IMAGE_VIEW_LONG_EDGE_PX) -> QSize:
-    """画像の縦横比を保ち、長辺が指定サイズになる画像表示領域を返す。"""
-    if source_size is None or not source_size.isValid() or long_edge_px <= 0:
+def _image_view_size_for_source(
+    source_size: QSize,
+    long_edge_px: int = STARTUP_IMAGE_VIEW_LONG_EDGE_PX,
+    portrait_height_px: int = STARTUP_PORTRAIT_IMAGE_VIEW_HEIGHT_PX,
+) -> QSize:
+    """画像の縦横比を保った起動時の画像表示領域サイズを返す。"""
+    if (
+        source_size is None
+        or not source_size.isValid()
+        or long_edge_px <= 0
+        or portrait_height_px <= 0
+    ):
         return QSize()
 
     source_width = source_size.width()
     source_height = source_size.height()
     if source_width >= source_height:
+        # 横長・正方形は従来どおり長辺を基準にする
         target_width = long_edge_px
         target_height = max(1, int(round(source_height * long_edge_px / source_width)))
     else:
-        target_width = max(1, int(round(source_width * long_edge_px / source_height)))
-        target_height = long_edge_px
+        # 縦長画像は表示領域の高さを900pxにする
+        target_width = max(1, int(round(source_width * portrait_height_px / source_height)))
+        target_height = portrait_height_px
     return QSize(target_width, target_height)
 
 
